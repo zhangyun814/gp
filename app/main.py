@@ -1,16 +1,21 @@
 import csv
 import io
+import json
 import logging
-from datetime import date
+import re
+from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import HTMLResponse
-from sqlalchemy import select
+from fastapi.responses import HTMLResponse, Response
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 from .analyzer import extract_topic, keyword_stats, rebuild_returns
 from .db import SessionLocal, init_db
-from .models import PlanetTopic, Stock, StockDailyQuote
-from .schemas import KeywordStat, TopicImportResult, TopicIn
+from .market import fetch_akshare_quotes
+from .models import (Keyword, PlanetCircle, PlanetTopic, Stock, StockDailyQuote,
+                     StockEventReturn, SyncJob, TopicKeyword, TopicStock)
+from .schemas import (KeywordStat, QuoteSyncIn, TopicAnnotationsIn, TopicImportResult, TopicIn,
+                      ZsxqSyncIn, ZsxqSyncResult)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("planet-stock")
@@ -24,16 +29,40 @@ async def lifespan(_app):
 
 app = FastAPI(title="知识星球观点分析", version="0.1.0", lifespan=lifespan)
 
+KEYWORD_SPLIT_RE = re.compile(r"[\s,，]+")
+
+
+def split_keywords(value: str) -> list[str]:
+    return list(dict.fromkeys(term for term in KEYWORD_SPLIT_RE.split(value.strip()) if term))
+
+
+def topic_summary(topic: PlanetTopic) -> dict:
+    return {"topic_id": topic.topic_id, "title": topic.title, "content": topic.content,
+            "author": topic.author, "published_at": topic.published_at, "source_url": topic.source_url,
+            "tags": json.loads(topic.tags or "[]")}
+
 
 @app.get("/", include_in_schema=False)
 def home():
-    return HTMLResponse("""<!doctype html><meta charset='utf-8'><title>股票观点关键词分析</title>
-    <style>body{font-family:system-ui;margin:40px;color:#17233b}table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:left}button{padding:8px 14px}</style>
-    <h1>知识星球股票观点关键词分析</h1>
-    <p>先通过 <a href='/docs'>API 文档</a> 导入主题和行情，再点击刷新统计。</p>
-    <button onclick='load()'>刷新关键词统计</button><p id='status'></p>
-    <table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来5日平均收益</th><th>涨幅≥10%比例</th><th>样本</th></tr></thead><tbody id='rows'></tbody></table>
-    <script>async function load(){const r=await fetch('/api/stats/keywords');const d=await r.json();document.getElementById('rows').innerHTML=d.map(x=>`<tr><td>${x.keyword}</td><td>${x.topic_count}</td><td>${x.stock_count}</td><td>${x.avg_return_5d==null?'-':(x.avg_return_5d*100).toFixed(2)+'%'}</td><td>${x.rise_rate_10pct==null?'-':(x.rise_rate_10pct*100).toFixed(2)+'%'}</td><td>${x.sample_sufficient?'充足':'不足10篇'}</td></tr>`).join('');document.getElementById('status').textContent='已刷新';}load()</script>""")
+    return HTMLResponse("""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'><title>知识星球股票观点分析</title>
+    <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px auto;max-width:1180px;color:#17233b;background:#f7f9fc}h1,h2{margin:0 0 14px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:22px;margin:18px 0;box-shadow:0 1px 2px #dfe6f033}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input{padding:10px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px}input[type=text]{min-width:280px}button,.button{padding:10px 15px;border:0;border-radius:7px;background:#1677ff;color:#fff;cursor:pointer;font-size:14px}button.secondary{background:#e8eef8;color:#29415f}.muted{color:#64748b;font-size:13px}.topic{padding:16px 0;border-bottom:1px solid #edf1f5}.topic:last-child{border-bottom:0}.topic-title{font-size:16px;font-weight:650;color:#17233b;cursor:pointer}.topic-title:hover{color:#1677ff}.meta{font-size:13px;color:#64748b;margin:7px 0}.preview{white-space:pre-wrap;line-height:1.6;color:#334155}.tag{display:inline-block;margin:3px 5px 0 0;padding:2px 7px;border-radius:12px;background:#e9f2ff;color:#2769b6;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:9px;border-bottom:1px solid #e8edf3;text-align:left}.pager{display:flex;gap:10px;align-items:center;margin-top:16px}dialog{border:0;border-radius:12px;width:min(780px,90vw);max-height:82vh;box-shadow:0 16px 50px #17233b66;padding:0}dialog::backdrop{background:#17233b77}.modal-head{display:flex;justify-content:space-between;gap:20px;padding:20px 22px;border-bottom:1px solid #e8edf3}.modal-body{padding:20px 22px;white-space:pre-wrap;line-height:1.7;overflow:auto;max-height:62vh}.close{background:transparent;color:#475569;font-size:22px;padding:0}.details{margin-top:16px;padding-top:12px;border-top:1px solid #e8edf3}.error{color:#c2410c}</style>
+    <body><h1>知识星球股票观点分析</h1><p class='muted'>主题按知识星球发布时间倒序；数据库保存的是接口返回的发布时间，不是本地同步时间。</p>
+    <section class='card'><h2>知识星球主题查询</h2><div class='controls'><input id='topic-keywords' type='text' placeholder='包含全部关键词，例如：深信服 翻倍'><button id='search-topics'>查询</button><button id='clear-topics' class='secondary'>清空</button></div><p id='topic-status' class='muted'></p><div id='topic-list'></div><div id='pager' class='pager'></div></section>
+    <section class='card'><h2>关键词统计</h2><div class='controls'><input id='stat-keyword' placeholder='关键词'><input id='stat-stock' placeholder='股票代码'><input id='stat-from' type='date'><input id='stat-to' type='date'><button id='load-stats'>刷新统计</button><a class='button' href='/api/export/keywords.csv'>导出 CSV</a></div><table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来5日平均收益</th><th>涨幅≥10%比例</th><th>样本</th></tr></thead><tbody id='stat-rows'></tbody></table></section>
+    <dialog id='topic-modal'><div class='modal-head'><div><strong id='modal-title'></strong><div id='modal-meta' class='meta'></div></div><button id='close-modal' class='close' aria-label='关闭'>×</button></div><div id='modal-body' class='modal-body'></div></dialog>
+    <script>
+    const state={page:1,pageSize:20}; const $=id=>document.getElementById(id);
+    const bjt=value=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(value));
+    const add=(parent,tag,text,className='')=>{const el=document.createElement(tag);el.textContent=text;if(className)el.className=className;parent.append(el);return el};
+    const tags=(parent,values)=>values.forEach(value=>add(parent,'span','#'+value,'tag'));
+    const preview=value=>value.replace(/\s+/g,' ').slice(0,180)+(value.replace(/\s+/g,' ').length>180?'…':'');
+    async function loadTopics(page=1){const q=new URLSearchParams({page:String(page),page_size:String(state.pageSize)});const keywords=$('topic-keywords').value.trim();if(keywords)q.set('keywords',keywords);const res=await fetch('/api/topics/search?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'查询失败');state.page=data.page;const list=$('topic-list');list.replaceChildren();$('topic-status').className='muted';$('topic-status').textContent=`共 ${data.total} 条${data.keywords.length?'；同时包含：'+data.keywords.join('、'):''}`;if(!data.items.length){add(list,'p','没有符合条件的主题。','muted')}data.items.forEach(topic=>{const row=document.createElement('article');row.className='topic';const title=add(row,'div',topic.title||'（无标题）','topic-title');title.onclick=()=>showTopic(topic.topic_id).catch(showError);add(row,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(row,'div',preview(topic.content),'preview');tags(row,topic.tags||[])});const pager=$('pager');pager.replaceChildren();const pages=Math.max(1,Math.ceil(data.total/data.page_size));const prev=add(pager,'button','上一页','secondary');prev.disabled=data.page<=1;prev.onclick=()=>loadTopics(data.page-1).catch(showError);add(pager,'span',`第 ${data.page} / ${pages} 页`,'muted');const next=add(pager,'button','下一页','secondary');next.disabled=data.page>=pages;next.onclick=()=>loadTopics(data.page+1).catch(showError)}
+    async function showTopic(id){const res=await fetch('/api/topics/'+encodeURIComponent(id));const topic=await res.json();if(!res.ok)throw new Error(topic.detail||'无法读取主题');$('modal-title').textContent=topic.title||'（无标题）';$('modal-meta').textContent=`知识星球发布时间：${bjt(topic.published_at)} · ${topic.author||'未知作者'}`;const body=$('modal-body');body.replaceChildren();tags(body,topic.tags||[]);add(body,'div',topic.content||'（无正文）','preview');const details=document.createElement('div');details.className='details';add(details,'div','已识别股票：'+(topic.stocks.map(x=>`${x.code} ${x.name}`.trim()).join('、')||'无'));add(details,'div','已识别关键词：'+(topic.keywords.map(x=>x.keyword).join('、')||'无'));body.append(details);$('topic-modal').showModal()}
+    async function loadStats(){const q=new URLSearchParams();[['stat-keyword','keyword'],['stat-stock','stock_code'],['stat-from','start_date'],['stat-to','end_date']].forEach(([id,key])=>{const value=$(id).value;if(value)q.set(key,value)});const res=await fetch('/api/stats/keywords?'+q);const data=await res.json();const rows=$('stat-rows');rows.replaceChildren();data.forEach(item=>{const row=document.createElement('tr');[item.keyword,item.topic_count,item.stock_count,item.avg_return_5d==null?'-':(item.avg_return_5d*100).toFixed(2)+'%',item.rise_rate_10pct==null?'-':(item.rise_rate_10pct*100).toFixed(2)+'%',item.sample_sufficient?'充足':'不足10篇'].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
+    $('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);loadTopics().catch(showError);loadStats().catch(showError);
+    </script></body></html>""")
 
 
 def db_session():
@@ -49,6 +78,15 @@ def health():
     return {"status": "ok"}
 
 
+def _topic_data(item: TopicIn) -> dict:
+    data = item.model_dump()
+    published_at = data["published_at"]
+    data["published_at"] = (published_at.replace(tzinfo=timezone.utc) if published_at.tzinfo is None
+                             else published_at.astimezone(timezone.utc))
+    data["tags"] = json.dumps(data.get("tags") or [], ensure_ascii=False)
+    return data
+
+
 @app.post("/api/topics/import", response_model=TopicImportResult)
 def import_topics(topics: list[TopicIn], db: Session = Depends(db_session)):
     imported = skipped = 0
@@ -56,12 +94,54 @@ def import_topics(topics: list[TopicIn], db: Session = Depends(db_session)):
         if db.scalar(select(PlanetTopic).where(PlanetTopic.topic_id == item.topic_id)):
             skipped += 1
             continue
-        topic = PlanetTopic(**item.model_dump())
+        topic = PlanetTopic(**_topic_data(item))
         db.add(topic); db.flush()
         extract_topic(db, topic)
         imported += 1
     db.commit()
     return {"imported": imported, "skipped": skipped}
+
+
+@app.post("/api/topics/sync/zsxq", response_model=ZsxqSyncResult)
+def sync_zsxq(request: ZsxqSyncIn, db: Session = Depends(db_session)):
+    """Receive normalized read-only topics from the host zsxq-cli script."""
+    if request.scope not in {"digests", "all"}:
+        raise HTTPException(400, "scope must be digests or all")
+    if len(request.topics) > 1000:
+        raise HTTPException(400, "at most 1000 topics per sync")
+    job = SyncJob(status="running")
+    db.add(job)
+    db.commit()
+    imported = skipped = 0
+    try:
+        circle = db.scalar(select(PlanetCircle).where(PlanetCircle.circle_id == request.group_id))
+        if not circle:
+            circle = PlanetCircle(circle_id=request.group_id, name=request.group_name or request.group_id)
+            db.add(circle)
+        elif request.group_name:
+            circle.name = request.group_name
+        for item in request.topics:
+            if db.scalar(select(PlanetTopic).where(PlanetTopic.topic_id == item.topic_id)):
+                skipped += 1
+                continue
+            topic = PlanetTopic(**_topic_data(item))
+            db.add(topic)
+            db.flush()
+            extract_topic(db, topic)
+            imported += 1
+        job.status = "success"
+        job.end_time = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        failed = db.get(SyncJob, job.id)
+        if failed:
+            failed.status = "failed"
+            failed.error_message = str(exc)[:2000]
+            failed.end_time = datetime.now(timezone.utc)
+            db.commit()
+        raise HTTPException(500, "主题同步失败，请查看同步任务记录") from exc
+    return {"job_id": job.id, "received": len(request.topics), "imported": imported, "skipped": skipped}
 
 
 @app.post("/api/quotes/import", include_in_schema=True)
@@ -103,6 +183,48 @@ async def import_quotes(file: UploadFile = File(...), db: Session = Depends(db_s
         raise HTTPException(400, f"invalid quote CSV: {exc}")
 
 
+@app.post("/api/quotes/sync")
+def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
+    """Fetch quotes through optional AKShare; use /api/quotes/import for CSV."""
+    if request.adjust_type not in {"qfq", "hfq", "none"}:
+        raise HTTPException(400, "adjust_type must be qfq, hfq or none")
+    end_date = request.end_date or date.today()
+    start_date = request.start_date or end_date - timedelta(days=365)
+    if start_date > end_date:
+        raise HTTPException(400, "start_date must be before end_date")
+    codes = request.stock_codes or [stock.stock_code for stock in db.scalars(select(Stock)).all()]
+    imported = skipped = 0
+    try:
+        for code in codes:
+            rows = fetch_akshare_quotes(code, start_date, end_date, request.adjust_type)
+            stock = db.scalar(select(Stock).where(Stock.stock_code == code))
+            if not stock:
+                stock = Stock(stock_code=code, exchange="SH" if code.startswith("6") else "SZ")
+                db.add(stock)
+                db.flush()
+            for row in rows:
+                trade_date = date.fromisoformat(row["date"])
+                exists = db.scalar(select(StockDailyQuote).where(StockDailyQuote.stock_id == stock.id,
+                                                                  StockDailyQuote.trade_date == trade_date,
+                                                                  StockDailyQuote.adjust_type == request.adjust_type))
+                if exists:
+                    skipped += 1
+                    continue
+                db.add(StockDailyQuote(stock_id=stock.id, trade_date=trade_date,
+                                       open=row["open"], high=row["high"], low=row["low"], close=row["close"],
+                                       volume=row["volume"], amount=row["amount"],
+                                       turnover_rate=row["turnover_rate"], adjust_type=request.adjust_type))
+                imported += 1
+        db.commit()
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(503, str(exc)) from exc
+    except (ValueError, KeyError) as exc:
+        db.rollback()
+        raise HTTPException(400, f"invalid market data: {exc}") from exc
+    return {"provider": "akshare", "imported": imported, "skipped": skipped}
+
+
 @app.post("/api/analyze/rebuild")
 def analyze(db: Session = Depends(db_session)):
     rebuild_returns(db)
@@ -111,13 +233,110 @@ def analyze(db: Session = Depends(db_session)):
 
 
 @app.get("/api/stats/keywords", response_model=list[KeywordStat])
-def stats(db: Session = Depends(db_session)):
-    return keyword_stats(db)
+def stats(keyword: str | None = None, stock_code: str | None = None,
+          start_date: date | None = None, end_date: date | None = None,
+          db: Session = Depends(db_session)):
+    return keyword_stats(db, keyword_filter=keyword, stock_code=stock_code,
+                         start_date=start_date, end_date=end_date)
+
+
+@app.get("/api/export/keywords.csv", include_in_schema=True)
+def export_keywords(keyword: str | None = None, stock_code: str | None = None,
+                    start_date: date | None = None, end_date: date | None = None,
+                    db: Session = Depends(db_session)):
+    rows = keyword_stats(db, keyword_filter=keyword, stock_code=stock_code,
+                         start_date=start_date, end_date=end_date)
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=("keyword", "topic_count", "stock_count", "avg_return_5d",
+                                                "rise_rate_10pct", "sample_sufficient"))
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(output.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=keyword_stats.csv"})
 
 
 @app.get("/api/topics")
 def topics(limit: int = 50, db: Session = Depends(db_session)):
     if limit < 1 or limit > 200:
         raise HTTPException(400, "limit must be between 1 and 200")
-    return [{"topic_id": t.topic_id, "title": t.title, "published_at": t.published_at, "source_url": t.source_url}
+    return [{key: value for key, value in topic_summary(t).items() if key != "content"}
             for t in db.scalars(select(PlanetTopic).order_by(PlanetTopic.published_at.desc()).limit(limit))]
+
+
+@app.get("/api/topics/search")
+def search_topics(keywords: str = "", page: int = 1, page_size: int = 20, db: Session = Depends(db_session)):
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(400, "page must be >= 1 and page_size must be between 1 and 100")
+    terms = split_keywords(keywords)
+    statement = select(PlanetTopic)
+    for term in terms:
+        pattern = f"%{term}%"
+        statement = statement.where(or_(PlanetTopic.title.ilike(pattern), PlanetTopic.content.ilike(pattern)))
+    total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    rows = db.scalars(statement.order_by(PlanetTopic.published_at.desc(), PlanetTopic.id.desc())
+                      .offset((page - 1) * page_size).limit(page_size)).all()
+    return {"items": [topic_summary(topic) for topic in rows], "total": total, "page": page,
+            "page_size": page_size, "keywords": terms}
+
+
+@app.get("/api/topics/{topic_id}")
+def topic_detail(topic_id: str, db: Session = Depends(db_session)):
+    topic = db.scalar(select(PlanetTopic).where(PlanetTopic.topic_id == topic_id))
+    if not topic:
+        raise HTTPException(404, "topic not found")
+    stocks = db.execute(select(TopicStock, Stock).join(Stock, Stock.id == TopicStock.stock_id)
+                        .where(TopicStock.topic_id == topic.id)).all()
+    keywords = db.execute(select(TopicKeyword, Keyword).join(Keyword, Keyword.id == TopicKeyword.keyword_id)
+                          .where(TopicKeyword.topic_id == topic.id)).all()
+    returns = db.execute(select(StockEventReturn).where(StockEventReturn.topic_id == topic.id)).scalars().all()
+    return {"topic_id": topic.topic_id, "title": topic.title, "content": topic.content, "author": topic.author,
+            "published_at": topic.published_at, "source_url": topic.source_url,
+            "tags": json.loads(topic.tags or "[]"),
+            "stocks": [{"code": stock.stock_code, "name": stock.stock_name, "context": link.mention_context,
+                        "confidence": float(link.confidence)} for link, stock in stocks],
+            "keywords": [{"keyword": keyword.keyword, "context": link.context} for link, keyword in keywords],
+            "returns": [{"stock_code": db.get(Stock, row.stock_id).stock_code, "event_date": row.event_date,
+                         "return_1d": row.return_1d, "return_3d": row.return_3d, "return_5d": row.return_5d,
+                         "return_10d": row.return_10d, "max_return_5d": row.max_return_5d,
+                         "rise_10pct_flag": row.rise_10pct_flag} for row in returns]}
+
+
+@app.put("/api/topics/{topic_id}/annotations")
+def update_annotations(topic_id: str, request: TopicAnnotationsIn, db: Session = Depends(db_session)):
+    """Replace extracted links after a human review."""
+    topic = db.scalar(select(PlanetTopic).where(PlanetTopic.topic_id == topic_id))
+    if not topic:
+        raise HTTPException(404, "topic not found")
+    db.execute(delete(TopicStock).where(TopicStock.topic_id == topic.id))
+    db.execute(delete(TopicKeyword).where(TopicKeyword.topic_id == topic.id))
+    db.execute(delete(StockEventReturn).where(StockEventReturn.topic_id == topic.id))
+    for item in request.stocks:
+        stock = db.scalar(select(Stock).where(Stock.stock_code == item.code))
+        if not stock:
+            stock = Stock(stock_code=item.code, stock_name=item.name,
+                          exchange="SH" if item.code.startswith("6") else "SZ")
+            db.add(stock)
+            db.flush()
+        elif item.name:
+            stock.stock_name = item.name
+        db.add(TopicStock(topic_id=topic.id, stock_id=stock.id, mention_context=item.context,
+                          confidence=item.confidence))
+    keywords = list(dict.fromkeys(item.strip() for item in request.keywords if item.strip()))
+    for raw in keywords:
+        keyword = db.scalar(select(Keyword).where(Keyword.normalized_keyword == raw))
+        if not keyword:
+            keyword = Keyword(keyword=raw, normalized_keyword=raw)
+            db.add(keyword)
+            db.flush()
+        db.add(TopicKeyword(topic_id=topic.id, keyword_id=keyword.id, context="人工标注"))
+    db.commit()
+    return {"topic_id": topic_id, "stocks": len(request.stocks), "keywords": len(keywords)}
+
+
+@app.get("/api/sync/jobs")
+def sync_jobs(limit: int = 20, db: Session = Depends(db_session)):
+    if limit < 1 or limit > 100:
+        raise HTTPException(400, "limit must be between 1 and 100")
+    return [{"id": job.id, "start_time": job.start_time, "end_time": job.end_time,
+             "status": job.status, "error_message": job.error_message}
+            for job in db.scalars(select(SyncJob).order_by(SyncJob.id.desc()).limit(limit))]

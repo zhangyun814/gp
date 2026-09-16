@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "zsxq": {
+      "source": "unnoo/zsxq-skill",
+      "sourceType": "github",
+      "skillPath": "skills/zsxq/SKILL.md",
+      "computedHash": "036d998ff6e6a644499c0f6c698dcf2b0ffb11f1b376d0bdab62ce8d00f5c3a4"
+    }
+  }
+}

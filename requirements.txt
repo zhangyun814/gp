@@ -4,3 +4,6 @@ SQLAlchemy==2.0.36
 psycopg[binary]==3.2.3
 pydantic-settings==2.7.1
 python-multipart==0.0.20
+jieba==0.42.1
+# AKShare is optional at runtime; keep it in the image so /api/quotes/sync works.
+-r requirements-market.txt

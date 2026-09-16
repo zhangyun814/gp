@@ -1,8 +1,12 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class PlanetCircle(Base):
@@ -21,7 +25,8 @@ class PlanetTopic(Base):
     author: Mapped[str] = mapped_column(String(200), default="")
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source_url: Mapped[str] = mapped_column(String(1000), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    tags: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     stocks = relationship("TopicStock", back_populates="topic", cascade="all, delete-orphan")
     keywords = relationship("TopicKeyword", back_populates="topic", cascade="all, delete-orphan")
 
@@ -100,7 +105,7 @@ class StockEventReturn(Base):
 class SyncJob(Base):
     __tablename__ = "sync_job"
     id: Mapped[int] = mapped_column(primary_key=True)
-    start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="running")
     error_message: Mapped[str] = mapped_column(Text, default="")

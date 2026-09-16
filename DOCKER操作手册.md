@@ -125,13 +125,39 @@ Navicat：
 密码：planet
 ```
 
-## 8. 进入数据库
+## 8. 知识星球同步
+
+知识星球同步在 Mac 主机执行，Docker 只负责接收数据和保存 PostgreSQL：
+
+```bash
+cd /Users/zhangyun/Documents/code/planet-stock-analyzer
+npm install -g zsxq-cli
+zsxq-cli auth login
+zsxq-cli auth status
+python3 scripts/sync_zsxq.py
+```
+
+默认读取 `星辰财经` 圈子的最新主题，最多 100 篇。脚本使用官方 CLI 支持的 `group +topics` 命令；当前 CLI 不提供“仅精华”筛选参数。增量同步可传入接口返回的时间游标：
+
+```bash
+python3 scripts/sync_zsxq.py --end-time '2026-09-16T10:52:34.729+0800'
+```
+
+## 9. 查看同步任务和统计
+
+```bash
+curl http://localhost:8000/api/sync/jobs
+curl http://localhost:8000/api/stats/keywords
+curl -OJ http://localhost:8000/api/export/keywords.csv
+```
+
+## 10. 进入数据库
 
 ```bash
 docker compose exec postgres psql -U planet -d planet_stock
 ```
 
-## 9. 危险命令
+## 11. 危险命令
 
 不要在确认数据已备份前执行：
 

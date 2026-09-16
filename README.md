@@ -1,6 +1,6 @@
 # 知识星球股票观点关键词分析工具
 
-用于分析**已授权导出的**知识星球主题与股票后续表现。第一版不绕过登录、验证码或平台访问控制，支持 JSON/CSV 导入；行情通过 AKShare 适配器获取，未配置行情源时可导入行情 CSV。
+用于分析你有权访问的知识星球主题与股票后续表现。同步使用知识星球官方 `zsxq-cli` 的 OAuth 只读接口，不依赖浏览器 Cookie，不绕过登录、验证码或平台访问控制；行情支持 CSV 和 AKShare。
 
 ## 快速启动
 
@@ -10,6 +10,35 @@ docker compose up --build
 ```
 
 打开 http://localhost:8000/docs。
+
+## 知识星球直连同步
+
+`zsxq-cli` 需要安装在 Mac 主机上（不要装进 Docker），凭据由官方 CLI 保存到系统 Keychain：
+
+```bash
+npm install -g zsxq-cli
+zsxq-cli auth login
+zsxq-cli auth status
+```
+
+首次默认同步“星辰财经”圈子的最新主题 5 页（最多 100 篇）：
+
+```bash
+cd /Users/zhangyun/Documents/code/planet-stock-analyzer
+python3 scripts/sync_zsxq.py
+```
+
+只读取并检查数量，不写入应用：
+
+```bash
+python3 scripts/sync_zsxq.py --dry-run
+```
+
+常用参数：`--group-id`、`--pages 5`、`--count 20`（单页最多 30）、`--end-time '2026-09-16T10:52:34.729+0800'`、`--app-url http://127.0.0.1:8000`。
+
+脚本使用官方 CLI 支持的 `group +topics` 命令读取并分页；当前 CLI 没有提供“仅精华”筛选参数，因此 v1 同步主题流，再在本地分析和筛选。不要再使用浏览器接口路径 `/v2/groups/<圈子ID>/topics`。
+
+同步脚本在主机上调用官方 CLI，再把脱敏后的主题字段 POST 到本机 `/api/topics/sync/zsxq`；容器内不会接触 Keychain 或 Token。
 
 ## 日常操作命令
 
@@ -129,12 +158,29 @@ curl -X POST http://localhost:8000/api/topics/import \
   -H 'content-type: application/json' --data @topics.json
 ```
 
+人工修正某篇主题的股票/关键词关联（会替换自动识别结果）：
+
+```bash
+curl -X PUT http://localhost:8000/api/topics/14425422115255122/annotations \
+  -H 'content-type: application/json' \
+  -d '{"stocks":[{"code":"300782","name":"卓胜微","confidence":1}],"keywords":["涨价","需求"]}'
+```
+
 ## 环境变量
 
 - `DATABASE_URL`：PostgreSQL 连接串
-- `KNOWLEDGE_PLANET_TOKEN`：仅供后续授权适配器使用，当前不会打印或写入数据库
+- `KNOWLEDGE_PLANET_TOKEN`：兼容旧配置，官方 CLI 流程不读取此变量；不要把 Token 写入代码或日志
 - `MARKET_DATA_PROVIDER`：`akshare` 或 `csv`
 - `MARKET_DATA_CSV`：CSV 行情文件路径（`code,date,open,high,low,close,volume,amount,turnover_rate`）
+
+Docker 镜像已包含 AKShare；如果直接在主机运行 Python，再安装可选依赖：
+
+```bash
+python3 -m pip install -r requirements-market.txt
+curl -X POST http://localhost:8000/api/quotes/sync \
+  -H 'content-type: application/json' \
+  -d '{"stock_codes":["600519"],"start_date":"2026-01-01","end_date":"2026-09-16","adjust_type":"qfq"}'
+```
 
 ## 说明
 

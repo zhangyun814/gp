@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from pydantic import BaseModel, Field
 
 
@@ -9,11 +9,24 @@ class TopicIn(BaseModel):
     author: str = ""
     published_at: datetime
     source_url: str = ""
+    tags: list[str] = Field(default_factory=list)
 
 
 class TopicImportResult(BaseModel):
     imported: int
     skipped: int
+
+
+class ZsxqSyncIn(BaseModel):
+    group_id: str = Field(min_length=1, max_length=100)
+    group_name: str = ""
+    scope: str = "digests"
+    topics: list[TopicIn] = Field(default_factory=list)
+
+
+class ZsxqSyncResult(TopicImportResult):
+    job_id: int
+    received: int
 
 
 class KeywordStat(BaseModel):
@@ -23,3 +36,22 @@ class KeywordStat(BaseModel):
     avg_return_5d: float | None
     rise_rate_10pct: float | None
     sample_sufficient: bool
+
+
+class QuoteSyncIn(BaseModel):
+    stock_codes: list[str] = Field(default_factory=list)
+    start_date: date | None = None
+    end_date: date | None = None
+    adjust_type: str = "qfq"
+
+
+class StockAnnotationIn(BaseModel):
+    code: str = Field(min_length=1, max_length=20)
+    name: str = ""
+    context: str = ""
+    confidence: float = Field(default=1.0, ge=0, le=1)
+
+
+class TopicAnnotationsIn(BaseModel):
+    stocks: list[StockAnnotationIn] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)

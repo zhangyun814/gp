@@ -1,0 +1,2 @@
+# Market-data provider used by /api/quotes/sync. CSV imports do not need it.
+akshare>=1.16.98
