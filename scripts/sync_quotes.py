@@ -38,8 +38,10 @@ def save_state(path: Path, state: dict) -> None:
     temporary.replace(path)
 
 
-def next_batch(codes: list[str], completed: set[str], size: int) -> list[str]:
-    return [code for code in codes if code not in completed][:size]
+def next_batch(codes: list[str], completed: set[str], size: int,
+               excluded: set[str] | None = None) -> list[str]:
+    excluded = excluded or set()
+    return [code for code in codes if code not in completed and code not in excluded][:size]
 
 
 def main() -> int:
@@ -60,25 +62,37 @@ def main() -> int:
     codes = read_json(f"{args.app_url.rstrip('/')}/api/stocks/mentioned")
     if not isinstance(codes, list):
         raise RuntimeError("应用没有返回股票代码列表")
-    imported = skipped = batches = 0
+    imported = skipped = no_data = invalid_rows = batches = 0
+    failed_codes: set[str] = set()
+    attempted: set[str] = set()
     for _ in range(args.batches):
-        batch = next_batch(codes, completed, args.batch_size)
+        batch = next_batch(codes, completed, args.batch_size, attempted)
         if not batch:
             break
+        attempted.update(batch)
         result = read_json(f"{args.app_url.rstrip('/')}/api/quotes/sync", {
             "stock_codes": batch, "start_date": args.start_date, "end_date": args.end_date, "adjust_type": "qfq",
         })
         imported += result["imported"]
         skipped += result["skipped"]
-        completed.update(batch)
+        no_data += result.get("no_data", 0)
+        invalid_rows += result.get("invalid_rows", 0)
+        batch_failed = set(result.get("failed_codes", []))
+        failed_codes.update(batch_failed)
+        completed.update(set(batch) - batch_failed)
         state["completed_codes"] = sorted(completed)
         state["start_date"], state["end_date"] = args.start_date, args.end_date
+        state["last_failed_codes"] = sorted(failed_codes)
         save_state(state_path, state)
         batches += 1
         print(json.dumps({"batch": batches, "completed": len(completed), "total": len(codes),
-                          "imported": imported, "skipped": skipped}, ensure_ascii=False))
+                          "imported": imported, "skipped": skipped, "no_data": no_data,
+                          "invalid_rows": invalid_rows, "failed": len(failed_codes)}, ensure_ascii=False))
     print(json.dumps({"completed": len(completed), "total": len(codes), "remaining": len(codes) - len(completed),
-                      "imported": imported, "skipped": skipped, "state_file": str(state_path)}, ensure_ascii=False))
+                      "imported": imported, "skipped": skipped, "no_data": no_data,
+                      "invalid_rows": invalid_rows, "failed": len(failed_codes),
+                      "failed_codes": sorted(failed_codes),
+                      "state_file": str(state_path)}, ensure_ascii=False))
     return 0
 
 

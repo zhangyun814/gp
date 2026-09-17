@@ -5,6 +5,7 @@ import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import delete, func, or_, select
@@ -48,7 +49,7 @@ def home():
     <meta name='viewport' content='width=device-width,initial-scale=1'><title>知识星球股票观点分析</title>
     <style>
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px auto;max-width:1180px;color:#17233b;background:#f7f9fc}h1,h2{margin:0 0 14px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:22px;margin:18px 0;box-shadow:0 1px 2px #dfe6f033}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input{padding:10px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px}input[type=text]{min-width:280px}button,.button{padding:10px 15px;border:0;border-radius:7px;background:#1677ff;color:#fff;cursor:pointer;font-size:14px}button.secondary{background:#e8eef8;color:#29415f}.muted{color:#64748b;font-size:13px}.topic{padding:16px 0;border-bottom:1px solid #edf1f5}.topic:last-child{border-bottom:0}.topic-title{font-size:16px;font-weight:650;color:#17233b;cursor:pointer}.topic-title:hover{color:#1677ff}.meta{font-size:13px;color:#64748b;margin:7px 0}.preview{white-space:pre-wrap;line-height:1.6;color:#334155}.tag{display:inline-block;margin:3px 5px 0 0;padding:2px 7px;border-radius:12px;background:#e9f2ff;color:#2769b6;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:9px;border-bottom:1px solid #e8edf3;text-align:left}.pager{display:flex;gap:10px;align-items:center;margin-top:16px}dialog{border:0;border-radius:12px;width:min(780px,90vw);max-height:82vh;box-shadow:0 16px 50px #17233b66;padding:0}dialog::backdrop{background:#17233b77}.modal-head{display:flex;justify-content:space-between;gap:20px;padding:20px 22px;border-bottom:1px solid #e8edf3}.modal-body{padding:20px 22px;white-space:pre-wrap;line-height:1.7;overflow:auto;max-height:62vh}.close{background:transparent;color:#475569;font-size:22px;padding:0}.details{margin-top:16px;padding-top:12px;border-top:1px solid #e8edf3}.error{color:#c2410c}</style>
-    <body><h1>知识星球股票观点分析</h1><p class='muted'>主题按知识星球发布时间倒序；数据库保存的是接口返回的发布时间，不是本地同步时间。</p>
+    <body><h1>知识星球股票观点分析</h1><p class='muted'>主题按知识星球发布时间倒序；数据库保存的是接口返回的发布时间，不是本地同步时间。 · <a href='/kline'>打开 K 线查询</a></p>
     <section class='card'><h2>知识星球主题查询</h2><div class='controls'><input id='topic-keywords' type='text' placeholder='包含全部关键词，例如：深信服 翻倍'><button id='search-topics'>查询</button><button id='clear-topics' class='secondary'>清空</button></div><p id='topic-status' class='muted'></p><div id='topic-list'></div><div id='pager' class='pager'></div></section>
     <section class='card'><h2>关键词统计</h2><p class='muted'>“未来 1 月”指发布事件日后的 20 个交易日；只有完整取得 20 个交易日行情的样本才参与涨幅≥10%排行。</p><div class='controls'><input id='stat-keyword' placeholder='关键词'><input id='stat-stock' placeholder='股票代码'><input id='stat-from' type='date'><input id='stat-to' type='date'><button id='load-stats'>刷新统计</button><a class='button' href='/api/export/keywords.csv'>导出 CSV</a></div><table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来1月平均收益</th><th>1月涨幅≥10%比例</th><th>有效样本</th></tr></thead><tbody id='stat-rows'></tbody></table></section>
     <dialog id='topic-modal'><div class='modal-head'><div><strong id='modal-title'></strong><div id='modal-meta' class='meta'></div></div><button id='close-modal' class='close' aria-label='关闭'>×</button></div><div id='modal-body' class='modal-body'></div></dialog>
@@ -63,6 +64,13 @@ def home():
     async function loadStats(){const q=new URLSearchParams();[['stat-keyword','keyword'],['stat-stock','stock_code'],['stat-from','start_date'],['stat-to','end_date']].forEach(([id,key])=>{const value=$(id).value;if(value)q.set(key,value)});const res=await fetch('/api/stats/keywords?'+q);const data=await res.json();const rows=$('stat-rows');rows.replaceChildren();data.forEach(item=>{const row=document.createElement('tr');[item.keyword,item.topic_count,item.stock_count,item.avg_return_20d==null?'-':(item.avg_return_20d*100).toFixed(2)+'%',item.rise_rate_10pct_20d==null?'-':(item.rise_rate_10pct_20d*100).toFixed(2)+'%',`${item.eligible_count_20d} / ${item.sample_sufficient?'充足':'不足10篇'}`].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
     $('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);loadTopics().catch(showError);loadStats().catch(showError);
     </script></body></html>""")
+
+
+@app.get("/kline", include_in_schema=False)
+def kline_page():
+    """Serve the standalone Lightweight Charts stock history page."""
+    html_path = Path(__file__).with_name("kline.html")
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
 def db_session():
@@ -229,17 +237,34 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
     if start_date > end_date:
         raise HTTPException(400, "start_date must be before end_date")
     codes = request.stock_codes or list(db.scalars(select(Stock.stock_code).join(TopicStock).distinct()))
-    imported = skipped = 0
+    imported = skipped = no_data = invalid_rows = 0
+    failed_codes: list[str] = []
     try:
         for code in codes:
-            rows = fetch_akshare_quotes(code, start_date, end_date, request.adjust_type)
+            # A single code/provider response must not abort the whole batch.
+            # Missing trading days are naturally omitted by AKShare; available
+            # rows are still imported and the next code continues normally.
+            try:
+                rows = fetch_akshare_quotes(code, start_date, end_date, request.adjust_type)
+            except Exception as exc:
+                failed_codes.append(code)
+                log.warning("quote fetch skipped code=%s (%s)", code, type(exc).__name__)
+                continue
+            if not rows:
+                no_data += 1
+                continue
             stock = db.scalar(select(Stock).where(Stock.stock_code == code))
             if not stock:
                 stock = Stock(stock_code=code, exchange="SH" if code.startswith("6") else "SZ")
                 db.add(stock)
                 db.flush()
             for row in rows:
-                trade_date = date.fromisoformat(row["date"])
+                try:
+                    trade_date = date.fromisoformat(row["date"])
+                except (KeyError, TypeError, ValueError):
+                    invalid_rows += 1
+                    log.warning("quote row skipped code=%s (invalid date)", code)
+                    continue
                 exists = db.scalar(select(StockDailyQuote).where(StockDailyQuote.stock_id == stock.id,
                                                                   StockDailyQuote.trade_date == trade_date,
                                                                   StockDailyQuote.adjust_type == request.adjust_type))
@@ -258,7 +283,61 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
     except (ValueError, KeyError) as exc:
         db.rollback()
         raise HTTPException(400, f"invalid market data: {exc}") from exc
-    return {"provider": "akshare", "imported": imported, "skipped": skipped}
+    return {"provider": "akshare", "imported": imported, "skipped": skipped, "no_data": no_data,
+            "invalid_rows": invalid_rows, "failed": len(failed_codes), "failed_codes": failed_codes}
+
+
+@app.get("/api/quotes/history/{stock_code}")
+def quote_history(stock_code: str, limit: int = 500, adjust_type: str = "qfq",
+                  db: Session = Depends(db_session)):
+    """Return daily OHLCV rows for the standalone candlestick page."""
+    if adjust_type not in {"qfq", "hfq", "none"}:
+        raise HTTPException(400, "adjust_type must be qfq, hfq or none")
+    if limit < 1 or limit > 2000:
+        raise HTTPException(400, "limit must be between 1 and 2000")
+    code = stock_code.strip().upper().replace(".", "")
+    if not code:
+        raise HTTPException(400, "stock_code is required")
+    stock = db.scalar(select(Stock).where(Stock.stock_code == code))
+    if not stock:
+        raise HTTPException(404, "未找到该股票或尚无行情数据")
+
+    rows = list(db.scalars(
+        select(StockDailyQuote)
+        .where(StockDailyQuote.stock_id == stock.id,
+               StockDailyQuote.adjust_type == adjust_type)
+        .order_by(StockDailyQuote.trade_date.desc())
+        .limit(limit + 1)
+    ))
+    rows.reverse()
+    if not rows:
+        raise HTTPException(404, "该股票暂无行情数据")
+
+    has_previous = len(rows) > limit
+    history = rows[-limit:] if has_previous else rows
+    previous_close = float(rows[0].close) if has_previous else None
+    items = []
+    for row in history:
+        close = float(row.close)
+        change_pct = ((close / previous_close) - 1) * 100 if previous_close else None
+        items.append({
+            "date": row.trade_date.isoformat(),
+            "open": float(row.open), "high": float(row.high),
+            "low": float(row.low), "close": close,
+            "volume": float(row.volume or 0),
+            "change_pct": change_pct,
+        })
+        previous_close = close
+    latest = items[-1]
+    return {
+        "code": stock.stock_code,
+        "name": stock.stock_name,
+        "adjust_type": adjust_type,
+        "latest_date": latest["date"],
+        "current_price": latest["close"],
+        "change_pct": latest["change_pct"],
+        "items": items,
+    }
 
 
 @app.get("/api/stocks/mentioned")

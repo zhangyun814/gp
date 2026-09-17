@@ -9,7 +9,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-打开 http://localhost:8000/docs。
+打开 http://localhost:8000/docs；K 线查询页面为 http://localhost:8000/kline。
+
+`/kline` 使用 TradingView `lightweight-charts` 绘制日线蜡烛图，读取 PostgreSQL 的 `stock_daily_quote`。输入已经同步行情的 A 股代码（例如 `600519`）即可查询；页面支持前复权、后复权、不复权和成交量展示。
 
 ## 知识星球直连同步
 
@@ -69,7 +71,7 @@ rm data/zsxq-backfill-2026.json
 在历史主题同步完成后，下载这些主题实际提到股票的前复权行情。脚本每批完成都会保存断点，重复同一命令会继续，不会重新下载已完成股票：
 
 ```bash
-python3 scripts/sync_quotes.py --start-date 2026-01-01 --end-date 2026-09-16 --batch-size 10 --batches 20
+python3 scripts/sync_quotes.py --start-date 2026-01-01 --end-date 2026-09-17 --batch-size 10 --batches 20
 ```
 
 最终输出的 `remaining` 为 0 后，重算收益：
@@ -79,6 +81,18 @@ curl -X POST http://localhost:8000/api/analyze/rebuild
 ```
 
 刷新首页的“关键词统计”，即可按“未来 1 月涨幅≥10%比例”查看排行。
+
+行情由 Docker 中的 app 访问外网。Mac 使用 Clash 时，Compose 默认通过 `host.docker.internal:7897` 连接宿主机代理；如果 Clash 端口不同，可在重启时覆盖：
+
+```bash
+DOCKER_HTTP_PROXY=http://host.docker.internal:端口 \
+DOCKER_HTTPS_PROXY=http://host.docker.internal:端口 \
+docker compose up -d app
+```
+
+行情接口会优先使用 AKShare 东方财富数据，接口被代理断开时自动切换到 AKShare 新浪历史行情。
+
+行情按交易日保存：周末、节假日、停牌或接口没有返回的日期会直接跳过，不会补造价格。单只股票或单行数据读取失败也不会中断整批同步；失败代码会保留在断点的 `last_failed_codes` 中，下一次运行时继续尝试。
 
 ## 日常操作命令
 

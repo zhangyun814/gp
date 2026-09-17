@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>股票 K 线查询</title>
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js'"></script>
+  <style>
+    :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17233b;background:#f5f7fb}
+    *{box-sizing:border-box}body{margin:0;padding:28px;min-height:100vh}
+    .shell{max-width:1260px;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:20px}
+    h1{font-size:25px;margin:0}.back{color:#2563eb;text-decoration:none;font-size:14px}.back:hover{text-decoration:underline}
+    .card{background:#fff;border:1px solid #e4eaf2;border-radius:14px;box-shadow:0 5px 18px #17233b0a;padding:22px}
+    .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.controls label{font-size:14px;color:#64748b}
+    input,select,button{height:42px;border-radius:8px;border:1px solid #cbd5e1;font:inherit}input{width:220px;padding:0 13px;font-size:15px;text-transform:uppercase}
+    button{padding:0 18px;color:#fff;background:#1677ff;border-color:#1677ff;cursor:pointer;font-weight:600}button:hover{background:#0f63d4}button:disabled{cursor:not-allowed;opacity:.55}
+    select{padding:0 10px;background:#fff;color:#334155}.hint{margin:12px 0 0;color:#64748b;font-size:13px}.error{color:#b42318!important}
+    .quote-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin:28px 0 18px;flex-wrap:wrap}.name-line{display:flex;align-items:baseline;gap:10px}.name{font-size:23px;font-weight:700}.code{font-size:14px;color:#64748b}.price{font-size:29px;font-weight:700}.change{font-size:16px;margin-left:10px}.up{color:#dc2626}.down{color:#16a34a}.flat{color:#64748b}
+    .chart-wrap{position:relative;height:610px;border:1px solid #e7edf4;border-radius:10px;overflow:hidden;background:#fff}.chart{width:100%;height:100%}
+    .tooltip{position:absolute;z-index:5;pointer-events:none;display:none;min-width:180px;padding:10px 12px;border:1px solid #d7e0ec;border-radius:8px;background:#fffffff2;box-shadow:0 4px 15px #17233b1c;font-size:12px;line-height:1.65;color:#334155}
+    .tooltip strong{display:block;margin-bottom:4px;color:#17233b;font-size:13px}.tooltip .up{color:#dc2626}.tooltip .down{color:#16a34a}
+    .foot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px;color:#64748b;font-size:12px}.loading{color:#2563eb}
+    @media(max-width:680px){body{padding:14px}.card{padding:15px}.chart-wrap{height:500px}input{width:180px}.quote-head{margin-top:20px}}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar"><h1>股票日线 K 线</h1><a class="back" href="/">返回观点分析首页</a></div>
+    <section class="card">
+      <div class="controls">
+        <label for="code">股票代码</label>
+        <input id="code" placeholder="例如 600519" autocomplete="off" spellcheck="false">
+        <select id="adjust" aria-label="复权方式"><option value="qfq">前复权</option><option value="hfq">后复权</option><option value="none">不复权</option></select>
+        <button id="query">查询</button>
+      </div>
+      <p id="status" class="hint">输入已同步到数据库的股票代码，按回车查询。</p>
+      <div id="quote-head" class="quote-head" hidden>
+        <div><div class="name-line"><span id="stock-name" class="name"></span><span id="stock-code" class="code"></span></div><div id="latest-date" class="hint"></div></div>
+        <div><span id="current-price" class="price"></span><span id="current-change" class="change"></span></div>
+      </div>
+      <div class="chart-wrap"><div id="chart" class="chart"></div><div id="tooltip" class="tooltip"></div></div>
+      <div class="foot"><span>红色上涨，绿色下跌；下方为成交量。</span><span id="source">数据来源：PostgreSQL stock_daily_quote</span></div>
+    </section>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id), UP='#dc2626', DOWN='#16a34a';
+    let chart, candleSeries, volumeSeries, resizeObserver;
+    const money=value=>Number(value).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const pct=value=>value==null?'—':`${value>=0?'+':''}${Number(value).toFixed(2)}%`;
+    const dateText=value=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(`${value}T00:00:00+08:00`));
+    function showStatus(text, error=false){$('status').textContent=text;$('status').className='hint'+(error?' error':'');}
+    function ensureChart(){
+      if(chart)return true;
+      if(!window.LightweightCharts){showStatus('图表库加载失败，请检查网络后刷新页面。',true);return false}
+      const el=$('chart');
+      chart=LightweightCharts.createChart(el,{width:el.clientWidth,height:el.clientHeight,layout:{background:{color:'#fff'},textColor:'#64748b'},grid:{vertLines:{color:'#eef2f7'},horzLines:{color:'#eef2f7'}},crosshair:{mode:LightweightCharts.CrosshairMode.Normal},rightPriceScale:{borderColor:'#d8e1ec'},timeScale:{borderColor:'#d8e1ec',timeVisible:false,secondsVisible:false}});
+      candleSeries=chart.addCandlestickSeries({upColor:UP,downColor:DOWN,borderUpColor:UP,wickUpColor:UP,borderDownColor:DOWN,wickDownColor:DOWN,priceFormat:{type:'price',precision:2,minMove:0.01}});
+      volumeSeries=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:''});
+      volumeSeries.priceScale().applyOptions({scaleMargins:{top:.82,bottom:0}});
+      const tooltip=$('tooltip');
+      const byDate=new Map();
+      chart.subscribeCrosshairMove(param=>{
+        const data=param.seriesData.get(candleSeries);
+        if(!data||!param.point||param.point.x<0||param.point.y<0){tooltip.style.display='none';return}
+        const item=byDate.get(String(data.time));
+        if(!item){tooltip.style.display='none';return}
+        const change=item.change_pct==null?'—':pct(item.change_pct);
+        tooltip.innerHTML=`<strong>${item.date}</strong><div>开盘 ${money(item.open)}　最高 ${money(item.high)}</div><div>最低 ${money(item.low)}　收盘 ${money(item.close)}</div><div>涨跌幅 <span class="${item.change_pct>=0?'up':'down'}">${change}</span></div>`;
+        tooltip.style.display='block';
+        const left=Math.min(Math.max(8,param.point.x+14),el.clientWidth-tooltip.offsetWidth-8);
+        const top=Math.min(Math.max(8,param.point.y-20),el.clientHeight-tooltip.offsetHeight-8);
+        tooltip.style.left=`${left}px`;tooltip.style.top=`${top}px`;
+      });
+      function resize(){chart.applyOptions({width:el.clientWidth,height:el.clientHeight})}
+      resizeObserver=new ResizeObserver(resize);resizeObserver.observe(el);
+      chart.__byDate=byDate;
+      return true;
+    }
+    async function query(){
+      const code=$('code').value.trim().toUpperCase();
+      if(!code){showStatus('请输入股票代码。',true);$('quote-head').hidden=true;return}
+      if(!ensureChart())return;
+      showStatus('正在读取行情…');
+      try{
+        const q=new URLSearchParams({limit:'1000',adjust_type:$('adjust').value});
+        const res=await fetch(`/api/quotes/history/${encodeURIComponent(code)}?${q}`);const data=await res.json();
+        if(!res.ok)throw new Error(data.detail||'读取行情失败');
+        if(!data.items.length)throw new Error('该股票暂无行情数据');
+        const candles=data.items.map(x=>({time:x.date,open:x.open,high:x.high,low:x.low,close:x.close}));
+        const volumes=data.items.map(x=>({time:x.date,value:x.volume||0,color:x.close>=x.open?UP:DOWN}));
+        candleSeries.setData(candles);volumeSeries.setData(volumes);chart.__byDate.clear();data.items.forEach(x=>chart.__byDate.set(x.date,x));chart.timeScale().fitContent();
+        $('stock-name').textContent=data.name||'未命名股票';$('stock-code').textContent=data.code;$('latest-date').textContent=`最新交易日：${data.latest_date}`;$('current-price').textContent=money(data.current_price);const change=$('current-change');change.textContent=pct(data.change_pct);change.className='change '+(data.change_pct>0?'up':data.change_pct<0?'down':'flat');$('quote-head').hidden=false;
+        $('source').textContent=`数据来源：PostgreSQL stock_daily_quote · ${$('adjust').selectedOptions[0].text}`;showStatus(`共 ${data.items.length} 个交易日`);
+      }catch(error){$('quote-head').hidden=true;showStatus(error.message,true)}
+    }
+    $('query').onclick=query;$('code').onkeydown=e=>{if(e.key==='Enter')query()};$('adjust').onchange=()=>{if($('code').value.trim())query()};
+  </script>
+</body>
+</html>

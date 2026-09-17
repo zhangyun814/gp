@@ -21,6 +21,11 @@ services:
       KNOWLEDGE_PLANET_TOKEN: ${KNOWLEDGE_PLANET_TOKEN:-}
       MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-csv}
       MARKET_DATA_CSV: ${MARKET_DATA_CSV:-/data/quotes.csv}
+      # Mac Docker containers must use the host gateway to reach Clash.
+      HTTP_PROXY: ${DOCKER_HTTP_PROXY:-http://host.docker.internal:7897}
+      HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-http://host.docker.internal:7897}
+      NO_PROXY: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,postgres}
+      no_proxy: ${DOCKER_NO_PROXY:-localhost,127.0.0.1,postgres}
     ports:
       - "8000:8000"
     depends_on:
