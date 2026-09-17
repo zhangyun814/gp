@@ -34,11 +34,51 @@ python3 scripts/sync_zsxq.py
 python3 scripts/sync_zsxq.py --dry-run
 ```
 
+### 按月回填今年历史主题（支持断点续拉）
+
+下面的命令会从当前月向前按月读取 2026 年主题；每成功同步一页，就把下一页游标写入 `data/zsxq-backfill-2026.json`。网络中断、关闭终端或达到 100 页上限后，直接重复执行**同一条命令**即可续拉，不会重复入库。
+
+```bash
+python3 scripts/sync_zsxq.py --backfill-year 2026 --pages 100 --count 30
+```
+
+终端最终会显示 `next_month`：有值表示尚未完成，重复执行即可；为 `null` 表示该年回填已完成。断点文件不包含主题正文、Cookie 或 Token，且已被 Git 忽略。需要从头重新回填时，停止同步后删除该断点文件：
+
+```bash
+rm data/zsxq-backfill-2026.json
+```
+
+只想验证某一个月的内容和耗时，不进入更早月份：
+
+```bash
+/usr/bin/time -p python3 scripts/sync_zsxq.py --backfill-month 2026-09 --pages 100 --count 30
+```
+
+这个命令的断点文件是 `data/zsxq-backfill-2026-09.json`；命令结束后显示的 `real` 就是本次实际耗时。若 `next_month` 为 `null`，说明 9 月同步完成。
+
 常用参数：`--group-id`、`--pages 5`、`--count 20`（单页最多 30）、`--end-time '2026-09-16T10:52:34.729+0800'`、`--app-url http://127.0.0.1:8000`。
 
 脚本使用官方 CLI 支持的 `group +topics` 命令读取并分页；当前 CLI 没有提供“仅精华”筛选参数，因此 v1 同步主题流，再在本地分析和筛选。不要再使用浏览器接口路径 `/v2/groups/<圈子ID>/topics`。
 
 同步脚本在主机上调用官方 CLI，再把脱敏后的主题字段 POST 到本机 `/api/topics/sync/zsxq`；容器内不会接触 Keychain 或 Token。
+
+## 一个月涨幅关键词统计
+
+“未来 1 月”按主题事件日后的 20 个交易日计算：期间最高收盘价相对事件日收盘价涨幅达到 10% 即标记为成功。只有完整取得 20 个交易日行情的主题会进入该排行；它是历史相关性统计，不是投资建议。
+
+在历史主题同步完成后，下载这些主题实际提到股票的前复权行情。脚本每批完成都会保存断点，重复同一命令会继续，不会重新下载已完成股票：
+
+```bash
+python3 scripts/sync_quotes.py --start-date 2026-01-01 --end-date 2026-09-16 --batch-size 10 --batches 20
+```
+
+最终输出的 `remaining` 为 0 后，重算收益：
+
+```bash
+curl -X POST http://localhost:8000/api/analyze/rebuild
+```
+
+刷新首页的“关键词统计”，即可按“未来 1 月涨幅≥10%比例”查看排行。
 
 ## 日常操作命令
 

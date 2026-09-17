@@ -35,6 +35,9 @@ class KeywordStat(BaseModel):
     stock_count: int
     avg_return_5d: float | None
     rise_rate_10pct: float | None
+    avg_return_20d: float | None
+    rise_rate_10pct_20d: float | None
+    eligible_count_20d: int
     sample_sufficient: bool
 
 

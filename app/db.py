@@ -19,3 +19,6 @@ def init_db():
     if engine.dialect.name == "postgresql":
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE planet_topic ADD COLUMN IF NOT EXISTS tags TEXT NOT NULL DEFAULT '[]'"))
+            connection.execute(text("ALTER TABLE stock_event_return ADD COLUMN IF NOT EXISTS return_20d NUMERIC(12, 6)"))
+            connection.execute(text("ALTER TABLE stock_event_return ADD COLUMN IF NOT EXISTS max_return_20d NUMERIC(12, 6)"))
+            connection.execute(text("ALTER TABLE stock_event_return ADD COLUMN IF NOT EXISTS rise_10pct_20d_flag BOOLEAN NOT NULL DEFAULT FALSE"))

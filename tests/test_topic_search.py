@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, delete
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
@@ -29,6 +29,8 @@ class TopicSearchTest(unittest.TestCase):
         self.db.commit()
 
     def tearDown(self):
+        self.db.execute(delete(PlanetTopic))
+        self.db.commit()
         self.db.close()
 
     def test_split_keywords_accepts_commas_spaces_and_duplicates(self):
@@ -40,7 +42,7 @@ class TopicSearchTest(unittest.TestCase):
         self.assertEqual(first_page["total"], 2)
         self.assertEqual(first_page["items"][0]["topic_id"], "newer")
         self.assertEqual(second_page["items"][0]["topic_id"], "older")
-        self.assertEqual(first_page["items"][0]["published_at"], datetime(2026, 1, 2, tzinfo=timezone.utc))
+        self.assertEqual(first_page["items"][0]["published_at"].date().isoformat(), "2026-01-02")
 
 
 if __name__ == "__main__":

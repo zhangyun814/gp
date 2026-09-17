@@ -33,3 +33,16 @@ def fetch_akshare_quotes(stock_code: str, start_date: date, end_date: date, adju
         })
     return [row for row in rows if row["date"] and row["date"] != "None" and row["close"] > 0]
 
+
+def fetch_akshare_stock_master() -> list[dict[str, str]]:
+    """Fetch the A-share code/name master used for topic name recognition."""
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError("未安装 AKShare，无法同步股票名称表") from exc
+    rows = []
+    for item in ak.stock_info_a_code_name().to_dict("records"):
+        code, name = str(item.get("code") or "").strip(), str(item.get("name") or "").strip()
+        if code.isdigit() and name:
+            rows.append({"code": code.zfill(6), "name": name})
+    return rows

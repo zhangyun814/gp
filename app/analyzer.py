@@ -31,7 +31,7 @@ STOCK_ALIASES = {
     "光库科技": ("300620", "光库科技"), "光库": ("300620", "光库科技"), "东田微": ("301183", "东田微"),
     "强瑞技术": ("301128", "强瑞技术"), "潍柴动力": ("000338", "潍柴动力"), "恒立液压": ("601100", "恒立液压"),
     "华丰科技": ("688629", "华丰科技"), "昌红科技": ("300151", "昌红科技"), "会稽山": ("601579", "会稽山"),
-    "沃尔德": ("688028", "沃尔德"),
+    "沃尔德": ("688028", "沃尔德"), "高澜股份": ("300499", "高澜股份"), "高澜": ("300499", "高澜股份"),
 }
 CODE_RE = re.compile(r"(?<!\d)(?:(?:SH|SZ)[.：:]?)?([036]\d{5})(?!\d)", re.I)
 BJT = ZoneInfo("Asia/Shanghai")
@@ -65,7 +65,7 @@ def _stock_record(db: Session, code: str, name: str = "") -> Stock:
     return stock
 
 
-def extract_topic(db: Session, topic: PlanetTopic):
+def extract_topic(db: Session, topic: PlanetTopic, stock_catalog: list[Stock] | None = None):
     text = f"{topic.title} {topic.content}"
     tokens = set(jieba.lcut(text))
     matches: dict[str, tuple[str, float, str]] = {}
@@ -75,7 +75,7 @@ def extract_topic(db: Session, topic: PlanetTopic):
     for alias, (code, name) in STOCK_ALIASES.items():
         if alias in text:
             matches.setdefault(code, (name, 0.9, alias))
-    for stock in list(db.scalars(select(Stock).where(Stock.stock_name != ""))):
+    for stock in stock_catalog if stock_catalog is not None else list(db.scalars(select(Stock).where(Stock.stock_name != ""))):
         if stock.stock_name in text:
             matches.setdefault(stock.stock_code, (stock.stock_name, 0.85, stock.stock_name))
     for code, (name, confidence, term) in matches.items():
@@ -110,13 +110,24 @@ def event_trade_date(db: Session, stock_id: int, published_at: datetime) -> date
 def next_quotes(db: Session, stock_id: int, event_date: date):
     return list(db.scalars(select(StockDailyQuote).where(StockDailyQuote.stock_id == stock_id,
                                                         StockDailyQuote.trade_date > event_date)
-                           .order_by(StockDailyQuote.trade_date).limit(10)))
+                           .order_by(StockDailyQuote.trade_date).limit(20)))
 
 
 def base_quote(db: Session, stock_id: int, event_date: date):
     return db.scalar(select(StockDailyQuote).where(StockDailyQuote.stock_id == stock_id,
                                                    StockDailyQuote.trade_date == event_date)
                      .order_by(StockDailyQuote.trade_date).limit(1))
+
+
+def return_metrics(base: Decimal, quotes) -> dict[str, Decimal | None]:
+    def ret(days: int):
+        return Decimal(str(quotes[days - 1].close)) / base - 1 if len(quotes) >= days else None
+
+    def max_ret(days: int):
+        return max(Decimal(str(row.close)) / base - 1 for row in quotes[:days]) if len(quotes) >= days else None
+
+    return {"return_1d": ret(1), "return_3d": ret(3), "return_5d": ret(5), "return_10d": ret(10),
+            "return_20d": ret(20), "max_return_5d": max_ret(5), "max_return_20d": max_ret(20)}
 
 
 def rebuild_returns(db: Session):
@@ -132,15 +143,11 @@ def rebuild_returns(db: Session):
             continue
         base = Decimal(str(base_quote_row.close))
 
-        def ret(n: int):
-            return (Decimal(str(quotes[n - 1].close)) / base - 1) if len(quotes) >= n else None
-
-        returns = {n: ret(n) for n in (1, 3, 5, 10)}
-        max5 = max((Decimal(str(q.close)) / base - 1 for q in quotes[:5]), default=None)
+        metrics = return_metrics(base, quotes)
         db.add(StockEventReturn(topic_id=topic.id, stock_id=link.stock_id, event_date=event_date,
-                                return_1d=returns[1], return_3d=returns[3], return_5d=returns[5],
-                                return_10d=returns[10], max_return_5d=max5,
-                                rise_10pct_flag=bool(max5 is not None and max5 >= Decimal(str(settings.rise_threshold)))))
+                                **metrics,
+                                rise_10pct_flag=bool(metrics["max_return_5d"] is not None and metrics["max_return_5d"] >= Decimal(str(settings.rise_threshold))),
+                                rise_10pct_20d_flag=bool(metrics["max_return_20d"] is not None and metrics["max_return_20d"] >= Decimal(str(settings.rise_threshold)))))
 
 
 def keyword_stats(db: Session, keyword_filter: str | None = None, stock_code: str | None = None,
@@ -165,10 +172,14 @@ def keyword_stats(db: Session, keyword_filter: str | None = None, stock_code: st
         rows = db.execute(statement).all()
         valid = [row[0] for row in rows if row[0].max_return_5d is not None]
         valid_5d = [row for row in valid if row.return_5d is not None]
+        valid_20d = [row[0] for row in rows if row[0].max_return_20d is not None]
+        return_20d = [row for row in valid_20d if row.return_20d is not None]
         topic_ids = {row[1].id for row in rows}
         stock_ids = {row[2].id for row in rows}
         result.append({"keyword": keyword.keyword, "topic_count": len(topic_ids), "stock_count": len(stock_ids),
                        "avg_return_5d": float(sum(row.return_5d for row in valid_5d) / len(valid_5d)) if valid_5d else None,
                        "rise_rate_10pct": sum(bool(row.rise_10pct_flag) for row in valid) / len(valid) if valid else None,
-                       "sample_sufficient": len(topic_ids) >= 10})
-    return sorted(result, key=lambda row: (row["sample_sufficient"], row["rise_rate_10pct"] or -1), reverse=True)
+                       "avg_return_20d": float(sum(row.return_20d for row in return_20d) / len(return_20d)) if return_20d else None,
+                       "rise_rate_10pct_20d": sum(bool(row.rise_10pct_20d_flag) for row in valid_20d) / len(valid_20d) if valid_20d else None,
+                       "eligible_count_20d": len(valid_20d), "sample_sufficient": len(valid_20d) >= 10})
+    return sorted(result, key=lambda row: (row["sample_sufficient"], row["rise_rate_10pct_20d"] or -1), reverse=True)

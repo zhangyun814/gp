@@ -11,7 +11,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 from .analyzer import extract_topic, keyword_stats, rebuild_returns
 from .db import SessionLocal, init_db
-from .market import fetch_akshare_quotes
+from .market import fetch_akshare_quotes, fetch_akshare_stock_master
 from .models import (Keyword, PlanetCircle, PlanetTopic, Stock, StockDailyQuote,
                      StockEventReturn, SyncJob, TopicKeyword, TopicStock)
 from .schemas import (KeywordStat, QuoteSyncIn, TopicAnnotationsIn, TopicImportResult, TopicIn,
@@ -44,13 +44,13 @@ def topic_summary(topic: PlanetTopic) -> dict:
 
 @app.get("/", include_in_schema=False)
 def home():
-    return HTMLResponse("""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
+    return HTMLResponse(r"""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
     <meta name='viewport' content='width=device-width,initial-scale=1'><title>知识星球股票观点分析</title>
     <style>
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px auto;max-width:1180px;color:#17233b;background:#f7f9fc}h1,h2{margin:0 0 14px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:22px;margin:18px 0;box-shadow:0 1px 2px #dfe6f033}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input{padding:10px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px}input[type=text]{min-width:280px}button,.button{padding:10px 15px;border:0;border-radius:7px;background:#1677ff;color:#fff;cursor:pointer;font-size:14px}button.secondary{background:#e8eef8;color:#29415f}.muted{color:#64748b;font-size:13px}.topic{padding:16px 0;border-bottom:1px solid #edf1f5}.topic:last-child{border-bottom:0}.topic-title{font-size:16px;font-weight:650;color:#17233b;cursor:pointer}.topic-title:hover{color:#1677ff}.meta{font-size:13px;color:#64748b;margin:7px 0}.preview{white-space:pre-wrap;line-height:1.6;color:#334155}.tag{display:inline-block;margin:3px 5px 0 0;padding:2px 7px;border-radius:12px;background:#e9f2ff;color:#2769b6;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:9px;border-bottom:1px solid #e8edf3;text-align:left}.pager{display:flex;gap:10px;align-items:center;margin-top:16px}dialog{border:0;border-radius:12px;width:min(780px,90vw);max-height:82vh;box-shadow:0 16px 50px #17233b66;padding:0}dialog::backdrop{background:#17233b77}.modal-head{display:flex;justify-content:space-between;gap:20px;padding:20px 22px;border-bottom:1px solid #e8edf3}.modal-body{padding:20px 22px;white-space:pre-wrap;line-height:1.7;overflow:auto;max-height:62vh}.close{background:transparent;color:#475569;font-size:22px;padding:0}.details{margin-top:16px;padding-top:12px;border-top:1px solid #e8edf3}.error{color:#c2410c}</style>
     <body><h1>知识星球股票观点分析</h1><p class='muted'>主题按知识星球发布时间倒序；数据库保存的是接口返回的发布时间，不是本地同步时间。</p>
     <section class='card'><h2>知识星球主题查询</h2><div class='controls'><input id='topic-keywords' type='text' placeholder='包含全部关键词，例如：深信服 翻倍'><button id='search-topics'>查询</button><button id='clear-topics' class='secondary'>清空</button></div><p id='topic-status' class='muted'></p><div id='topic-list'></div><div id='pager' class='pager'></div></section>
-    <section class='card'><h2>关键词统计</h2><div class='controls'><input id='stat-keyword' placeholder='关键词'><input id='stat-stock' placeholder='股票代码'><input id='stat-from' type='date'><input id='stat-to' type='date'><button id='load-stats'>刷新统计</button><a class='button' href='/api/export/keywords.csv'>导出 CSV</a></div><table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来5日平均收益</th><th>涨幅≥10%比例</th><th>样本</th></tr></thead><tbody id='stat-rows'></tbody></table></section>
+    <section class='card'><h2>关键词统计</h2><p class='muted'>“未来 1 月”指发布事件日后的 20 个交易日；只有完整取得 20 个交易日行情的样本才参与涨幅≥10%排行。</p><div class='controls'><input id='stat-keyword' placeholder='关键词'><input id='stat-stock' placeholder='股票代码'><input id='stat-from' type='date'><input id='stat-to' type='date'><button id='load-stats'>刷新统计</button><a class='button' href='/api/export/keywords.csv'>导出 CSV</a></div><table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来1月平均收益</th><th>1月涨幅≥10%比例</th><th>有效样本</th></tr></thead><tbody id='stat-rows'></tbody></table></section>
     <dialog id='topic-modal'><div class='modal-head'><div><strong id='modal-title'></strong><div id='modal-meta' class='meta'></div></div><button id='close-modal' class='close' aria-label='关闭'>×</button></div><div id='modal-body' class='modal-body'></div></dialog>
     <script>
     const state={page:1,pageSize:20}; const $=id=>document.getElementById(id);
@@ -58,9 +58,9 @@ def home():
     const add=(parent,tag,text,className='')=>{const el=document.createElement(tag);el.textContent=text;if(className)el.className=className;parent.append(el);return el};
     const tags=(parent,values)=>values.forEach(value=>add(parent,'span','#'+value,'tag'));
     const preview=value=>value.replace(/\s+/g,' ').slice(0,180)+(value.replace(/\s+/g,' ').length>180?'…':'');
-    async function loadTopics(page=1){const q=new URLSearchParams({page:String(page),page_size:String(state.pageSize)});const keywords=$('topic-keywords').value.trim();if(keywords)q.set('keywords',keywords);const res=await fetch('/api/topics/search?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'查询失败');state.page=data.page;const list=$('topic-list');list.replaceChildren();$('topic-status').className='muted';$('topic-status').textContent=`共 ${data.total} 条${data.keywords.length?'；同时包含：'+data.keywords.join('、'):''}`;if(!data.items.length){add(list,'p','没有符合条件的主题。','muted')}data.items.forEach(topic=>{const row=document.createElement('article');row.className='topic';const title=add(row,'div',topic.title||'（无标题）','topic-title');title.onclick=()=>showTopic(topic.topic_id).catch(showError);add(row,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(row,'div',preview(topic.content),'preview');tags(row,topic.tags||[])});const pager=$('pager');pager.replaceChildren();const pages=Math.max(1,Math.ceil(data.total/data.page_size));const prev=add(pager,'button','上一页','secondary');prev.disabled=data.page<=1;prev.onclick=()=>loadTopics(data.page-1).catch(showError);add(pager,'span',`第 ${data.page} / ${pages} 页`,'muted');const next=add(pager,'button','下一页','secondary');next.disabled=data.page>=pages;next.onclick=()=>loadTopics(data.page+1).catch(showError)}
+    async function loadTopics(page=1){const q=new URLSearchParams({page:String(page),page_size:String(state.pageSize)});const keywords=$('topic-keywords').value.trim();if(keywords)q.set('keywords',keywords);const res=await fetch('/api/topics/search?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'查询失败');state.page=data.page;const list=$('topic-list');list.replaceChildren();$('topic-status').className='muted';$('topic-status').textContent=`共 ${data.total} 条${data.keywords.length?'；同时包含：'+data.keywords.join('、'):''}`;if(!data.items.length){add(list,'p','没有符合条件的主题。','muted')}data.items.forEach(topic=>{const row=document.createElement('article');row.className='topic';const title=add(row,'div',topic.title||'（无标题）','topic-title');title.onclick=()=>showTopic(topic.topic_id).catch(showError);add(row,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(row,'div',preview(topic.content),'preview');tags(row,topic.tags||[]);list.append(row)});const pager=$('pager');pager.replaceChildren();const pages=Math.max(1,Math.ceil(data.total/data.page_size));const prev=add(pager,'button','上一页','secondary');prev.disabled=data.page<=1;prev.onclick=()=>loadTopics(data.page-1).catch(showError);add(pager,'span',`第 ${data.page} / ${pages} 页`,'muted');const pageInput=document.createElement('input');pageInput.type='number';pageInput.min='1';pageInput.max=String(pages);pageInput.value=String(data.page);pageInput.style.width='64px';pageInput.setAttribute('aria-label','跳转页码');pager.append(pageInput);const jump=add(pager,'button','跳转','secondary');const go=()=>{const target=Number(pageInput.value);if(!Number.isInteger(target)||target<1||target>pages){throw new Error(`请输入 1 到 ${pages} 的页码`)}return loadTopics(target)};jump.onclick=()=>go().catch(showError);pageInput.onkeydown=event=>{if(event.key==='Enter')go().catch(showError)};const next=add(pager,'button','下一页','secondary');next.disabled=data.page>=pages;next.onclick=()=>loadTopics(data.page+1).catch(showError)}
     async function showTopic(id){const res=await fetch('/api/topics/'+encodeURIComponent(id));const topic=await res.json();if(!res.ok)throw new Error(topic.detail||'无法读取主题');$('modal-title').textContent=topic.title||'（无标题）';$('modal-meta').textContent=`知识星球发布时间：${bjt(topic.published_at)} · ${topic.author||'未知作者'}`;const body=$('modal-body');body.replaceChildren();tags(body,topic.tags||[]);add(body,'div',topic.content||'（无正文）','preview');const details=document.createElement('div');details.className='details';add(details,'div','已识别股票：'+(topic.stocks.map(x=>`${x.code} ${x.name}`.trim()).join('、')||'无'));add(details,'div','已识别关键词：'+(topic.keywords.map(x=>x.keyword).join('、')||'无'));body.append(details);$('topic-modal').showModal()}
-    async function loadStats(){const q=new URLSearchParams();[['stat-keyword','keyword'],['stat-stock','stock_code'],['stat-from','start_date'],['stat-to','end_date']].forEach(([id,key])=>{const value=$(id).value;if(value)q.set(key,value)});const res=await fetch('/api/stats/keywords?'+q);const data=await res.json();const rows=$('stat-rows');rows.replaceChildren();data.forEach(item=>{const row=document.createElement('tr');[item.keyword,item.topic_count,item.stock_count,item.avg_return_5d==null?'-':(item.avg_return_5d*100).toFixed(2)+'%',item.rise_rate_10pct==null?'-':(item.rise_rate_10pct*100).toFixed(2)+'%',item.sample_sufficient?'充足':'不足10篇'].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
+    async function loadStats(){const q=new URLSearchParams();[['stat-keyword','keyword'],['stat-stock','stock_code'],['stat-from','start_date'],['stat-to','end_date']].forEach(([id,key])=>{const value=$(id).value;if(value)q.set(key,value)});const res=await fetch('/api/stats/keywords?'+q);const data=await res.json();const rows=$('stat-rows');rows.replaceChildren();data.forEach(item=>{const row=document.createElement('tr');[item.keyword,item.topic_count,item.stock_count,item.avg_return_20d==null?'-':(item.avg_return_20d*100).toFixed(2)+'%',item.rise_rate_10pct_20d==null?'-':(item.rise_rate_10pct_20d*100).toFixed(2)+'%',`${item.eligible_count_20d} / ${item.sample_sufficient?'充足':'不足10篇'}`].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
     $('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);loadTopics().catch(showError);loadStats().catch(showError);
     </script></body></html>""")
 
@@ -90,13 +90,14 @@ def _topic_data(item: TopicIn) -> dict:
 @app.post("/api/topics/import", response_model=TopicImportResult)
 def import_topics(topics: list[TopicIn], db: Session = Depends(db_session)):
     imported = skipped = 0
+    stock_catalog = list(db.scalars(select(Stock).where(Stock.stock_name != "")))
     for item in topics:
         if db.scalar(select(PlanetTopic).where(PlanetTopic.topic_id == item.topic_id)):
             skipped += 1
             continue
         topic = PlanetTopic(**_topic_data(item))
         db.add(topic); db.flush()
-        extract_topic(db, topic)
+        extract_topic(db, topic, stock_catalog)
         imported += 1
     db.commit()
     return {"imported": imported, "skipped": skipped}
@@ -120,6 +121,7 @@ def sync_zsxq(request: ZsxqSyncIn, db: Session = Depends(db_session)):
             db.add(circle)
         elif request.group_name:
             circle.name = request.group_name
+        stock_catalog = list(db.scalars(select(Stock).where(Stock.stock_name != "")))
         for item in request.topics:
             if db.scalar(select(PlanetTopic).where(PlanetTopic.topic_id == item.topic_id)):
                 skipped += 1
@@ -127,7 +129,7 @@ def sync_zsxq(request: ZsxqSyncIn, db: Session = Depends(db_session)):
             topic = PlanetTopic(**_topic_data(item))
             db.add(topic)
             db.flush()
-            extract_topic(db, topic)
+            extract_topic(db, topic, stock_catalog)
             imported += 1
         job.status = "success"
         job.end_time = datetime.now(timezone.utc)
@@ -142,6 +144,40 @@ def sync_zsxq(request: ZsxqSyncIn, db: Session = Depends(db_session)):
             db.commit()
         raise HTTPException(500, "主题同步失败，请查看同步任务记录") from exc
     return {"job_id": job.id, "received": len(request.topics), "imported": imported, "skipped": skipped}
+
+
+@app.post("/api/stocks/sync-master")
+def sync_stock_master(db: Session = Depends(db_session)):
+    """Refresh the A-share name dictionary used for automatic name matching."""
+    try:
+        rows = fetch_akshare_stock_master()
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    existing = {stock.stock_code: stock for stock in db.scalars(select(Stock))}
+    imported = updated = 0
+    for row in rows:
+        stock = existing.get(row["code"])
+        if not stock:
+            db.add(Stock(stock_code=row["code"], stock_name=row["name"], exchange="SH" if row["code"].startswith("6") else "SZ"))
+            imported += 1
+        elif stock.stock_name != row["name"]:
+            stock.stock_name = row["name"]
+            updated += 1
+    db.commit()
+    return {"provider": "akshare", "total": len(rows), "imported": imported, "updated": updated}
+
+
+@app.post("/api/topics/reanalyze-stocks")
+def reanalyze_topic_stocks(db: Session = Depends(db_session)):
+    """Add newly recognizable stock links to existing topics without replacing manual links."""
+    topics = list(db.scalars(select(PlanetTopic)))
+    stock_catalog = list(db.scalars(select(Stock).where(Stock.stock_name != "")))
+    before = db.scalar(select(func.count()).select_from(TopicStock)) or 0
+    for topic in topics:
+        extract_topic(db, topic, stock_catalog)
+    db.commit()
+    after = db.scalar(select(func.count()).select_from(TopicStock)) or 0
+    return {"topics": len(topics), "stock_master": len(stock_catalog), "links_added": after - before}
 
 
 @app.post("/api/quotes/import", include_in_schema=True)
@@ -192,7 +228,7 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
     start_date = request.start_date or end_date - timedelta(days=365)
     if start_date > end_date:
         raise HTTPException(400, "start_date must be before end_date")
-    codes = request.stock_codes or [stock.stock_code for stock in db.scalars(select(Stock)).all()]
+    codes = request.stock_codes or list(db.scalars(select(Stock.stock_code).join(TopicStock).distinct()))
     imported = skipped = 0
     try:
         for code in codes:
@@ -225,6 +261,12 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
     return {"provider": "akshare", "imported": imported, "skipped": skipped}
 
 
+@app.get("/api/stocks/mentioned")
+def mentioned_stock_codes(db: Session = Depends(db_session)):
+    """Codes referenced by at least one Knowledge Planet topic."""
+    return list(db.scalars(select(Stock.stock_code).join(TopicStock).distinct().order_by(Stock.stock_code)))
+
+
 @app.post("/api/analyze/rebuild")
 def analyze(db: Session = Depends(db_session)):
     rebuild_returns(db)
@@ -248,7 +290,8 @@ def export_keywords(keyword: str | None = None, stock_code: str | None = None,
                          start_date=start_date, end_date=end_date)
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=("keyword", "topic_count", "stock_count", "avg_return_5d",
-                                                "rise_rate_10pct", "sample_sufficient"))
+                                                "rise_rate_10pct", "avg_return_20d", "rise_rate_10pct_20d",
+                                                "eligible_count_20d", "sample_sufficient"))
     writer.writeheader()
     writer.writerows(rows)
     return Response(output.getvalue(), media_type="text/csv; charset=utf-8",
@@ -297,8 +340,10 @@ def topic_detail(topic_id: str, db: Session = Depends(db_session)):
             "keywords": [{"keyword": keyword.keyword, "context": link.context} for link, keyword in keywords],
             "returns": [{"stock_code": db.get(Stock, row.stock_id).stock_code, "event_date": row.event_date,
                          "return_1d": row.return_1d, "return_3d": row.return_3d, "return_5d": row.return_5d,
-                         "return_10d": row.return_10d, "max_return_5d": row.max_return_5d,
-                         "rise_10pct_flag": row.rise_10pct_flag} for row in returns]}
+                         "return_10d": row.return_10d, "return_20d": row.return_20d,
+                         "max_return_5d": row.max_return_5d, "max_return_20d": row.max_return_20d,
+                         "rise_10pct_flag": row.rise_10pct_flag,
+                         "rise_10pct_20d_flag": row.rise_10pct_20d_flag} for row in returns]}
 
 
 @app.put("/api/topics/{topic_id}/annotations")

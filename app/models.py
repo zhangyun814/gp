@@ -97,8 +97,11 @@ class StockEventReturn(Base):
     return_3d: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     return_5d: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     return_10d: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    return_20d: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     max_return_5d: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    max_return_20d: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     rise_10pct_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+    rise_10pct_20d_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     __table_args__ = (UniqueConstraint("topic_id", "stock_id"),)
 
 

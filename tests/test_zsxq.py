@@ -1,10 +1,13 @@
 import json
+import tempfile
 import unittest
+from argparse import Namespace
+from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from app.zsxq import normalize_response, parse_cli_json, parse_time, response_next_end_time
-from scripts.sync_zsxq import fetch_page, payload_shape
+from scripts.sync_zsxq import backfill_year, fetch_page, payload_shape, topics_in_month
 
 
 class ZsxqParserTest(unittest.TestCase):
@@ -97,6 +100,35 @@ class ZsxqParserTest(unittest.TestCase):
         shape = payload_shape({"data": {"topics": [{"topic_id": "1", "talk": {"text": "私密正文"}}]}})
         self.assertEqual(shape["data"]["topics"]["list_length"], 1)
         self.assertNotIn("私密正文", str(shape))
+
+    @patch("scripts.sync_zsxq.post_topics")
+    @patch("scripts.sync_zsxq.fetch_page")
+    def test_backfill_saves_cursor_after_each_page(self, fetch, post):
+        fetch.return_value = {"has_more": True, "next_end_time": "2026-09-15T00:00:00+0800", "topics_brief": [{
+            "topic_id": "sep-topic", "content": "正文", "create_time": "2026-09-15T09:00:00+0800", "owner": {"name": "作者"},
+        }]}
+        post.return_value = {"imported": 1, "skipped": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "backfill.json"
+            args = Namespace(backfill_year=2026, state_file=str(state_file), pages=1, count=30,
+                             cli="zsxq-cli", group_id="group", scope="all", app_url="http://app",
+                             dry_run=False, debug=False, backfill_month=None)
+            result = backfill_year(args)
+            state = json.loads(state_file.read_text())
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(state["current_month"], "2026-09")
+        self.assertEqual(state["end_time"], "2026-09-15T00:00:00+0800")
+        self.assertEqual(post.call_args.args[3][0]["topic_id"], "sep-topic")
+
+    def test_topics_in_month_excludes_other_months(self):
+        september, october = parse_time("2026-09-01T00:00:00+0800"), parse_time("2026-10-01T00:00:00+0800")
+        topics = [{"topic_id": "sep", "published_at": "2026-09-30T23:59:59+0800"},
+                  {"topic_id": "aug", "published_at": "2026-08-31T23:59:59+0800"}]
+        self.assertEqual([topic["topic_id"] for topic in topics_in_month(topics, september, october)], ["sep"])
+
+    def test_month_keys_can_limit_to_one_month(self):
+        from scripts.sync_zsxq import month_keys
+        self.assertEqual(month_keys(2026, "2026-09"), ["2026-09"])
 
 
 if __name__ == "__main__":
