@@ -10,7 +10,8 @@ from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
-from .analyzer import extract_topic, keyword_stats, rebuild_returns
+from .analyzer import (AUTO_KEYWORD_MIN_SAMPLES, discover_auto_keywords, discovered_keyword_detail,
+                       discovered_keyword_stats, extract_topic, keyword_stats, rebuild_returns)
 from .db import SessionLocal, init_db
 from .market import fetch_akshare_quotes, fetch_akshare_stock_master
 from .models import (Keyword, PlanetCircle, PlanetTopic, Stock, StockDailyQuote,
@@ -43,26 +44,51 @@ def topic_summary(topic: PlanetTopic) -> dict:
             "tags": json.loads(topic.tags or "[]")}
 
 
+def latest_quote_checkpoint(data_dir: Path = Path("/data")) -> dict | None:
+    """Read the newest valid full-market quote checkpoint."""
+    candidates = sorted(data_dir.glob("quote-sync-all-*.json"),
+                        key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in candidates:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(state, dict) or not isinstance(state.get("completed_codes"), list):
+            continue
+        state = dict(state)
+        state["state_file"] = path.name
+        state["updated_at"] = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        return state
+    return None
+
+
 @app.get("/", include_in_schema=False)
 def home():
     return HTMLResponse(r"""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
     <meta name='viewport' content='width=device-width,initial-scale=1'><title>知识星球股票观点分析</title>
     <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px auto;max-width:1180px;color:#17233b;background:#f7f9fc}h1,h2{margin:0 0 14px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:22px;margin:18px 0;box-shadow:0 1px 2px #dfe6f033}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input{padding:10px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px}input[type=text]{min-width:280px}button,.button{padding:10px 15px;border:0;border-radius:7px;background:#1677ff;color:#fff;cursor:pointer;font-size:14px}button.secondary{background:#e8eef8;color:#29415f}.muted{color:#64748b;font-size:13px}.topic{padding:16px 0;border-bottom:1px solid #edf1f5}.topic:last-child{border-bottom:0}.topic-title{font-size:16px;font-weight:650;color:#17233b;cursor:pointer}.topic-title:hover{color:#1677ff}.meta{font-size:13px;color:#64748b;margin:7px 0}.preview{white-space:pre-wrap;line-height:1.6;color:#334155}.tag{display:inline-block;margin:3px 5px 0 0;padding:2px 7px;border-radius:12px;background:#e9f2ff;color:#2769b6;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:9px;border-bottom:1px solid #e8edf3;text-align:left}.pager{display:flex;gap:10px;align-items:center;margin-top:16px}dialog{border:0;border-radius:12px;width:min(780px,90vw);max-height:82vh;box-shadow:0 16px 50px #17233b66;padding:0}dialog::backdrop{background:#17233b77}.modal-head{display:flex;justify-content:space-between;gap:20px;padding:20px 22px;border-bottom:1px solid #e8edf3}.modal-body{padding:20px 22px;white-space:pre-wrap;line-height:1.7;overflow:auto;max-height:62vh}.close{background:transparent;color:#475569;font-size:22px;padding:0}.details{margin-top:16px;padding-top:12px;border-top:1px solid #e8edf3}.error{color:#c2410c}</style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px auto;max-width:1180px;color:#17233b;background:#f7f9fc}h1,h2{margin:0 0 14px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:22px;margin:18px 0;box-shadow:0 1px 2px #dfe6f033}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input{padding:10px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px}input[type=text]{min-width:280px}button,.button{padding:10px 15px;border:0;border-radius:7px;background:#1677ff;color:#fff;cursor:pointer;font-size:14px}button.secondary{background:#e8eef8;color:#29415f}.muted{color:#64748b;font-size:13px}.progress{height:10px;background:#e8eef8;border-radius:8px;overflow:hidden;margin:14px 0}.progress>span{display:block;height:100%;background:#1677ff}.summary{display:flex;gap:28px;flex-wrap:wrap}.summary strong{display:block;font-size:22px;margin-bottom:4px}.topic{padding:16px 0;border-bottom:1px solid #edf1f5}.topic:last-child{border-bottom:0}.topic-title{font-size:16px;font-weight:650;color:#17233b;cursor:pointer}.topic-title:hover{color:#1677ff}.meta{font-size:13px;color:#64748b;margin:7px 0}.preview{white-space:pre-wrap;line-height:1.6;color:#334155}.tag{display:inline-block;margin:3px 5px 0 0;padding:2px 7px;border-radius:12px;background:#e9f2ff;color:#2769b6;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:9px;border-bottom:1px solid #e8edf3;text-align:left}.pager{display:flex;gap:10px;align-items:center;margin-top:16px}dialog{border:0;border-radius:12px;width:min(780px,90vw);max-height:82vh;box-shadow:0 16px 50px #17233b66;padding:0}dialog::backdrop{background:#17233b77}.modal-head{display:flex;justify-content:space-between;gap:20px;padding:20px 22px;border-bottom:1px solid #e8edf3}.modal-body{padding:20px 22px;white-space:pre-wrap;line-height:1.7;overflow:auto;max-height:62vh}.close{background:transparent;color:#475569;font-size:22px;padding:0}.details{margin-top:16px;padding-top:12px;border-top:1px solid #e8edf3}.error{color:#c2410c}</style>
     <body><h1>知识星球股票观点分析</h1><p class='muted'>主题按知识星球发布时间倒序；数据库保存的是接口返回的发布时间，不是本地同步时间。 · <a href='/kline'>打开 K 线查询</a></p>
+    <section class='card'><h2>行情同步进度</h2><div class='controls'><button id='load-quote-status'>刷新进度</button><span id='quote-status' class='muted'></span></div><div id='quote-progress'></div><div id='quote-summary' class='summary'></div><p id='quote-detail' class='muted'></p></section>
     <section class='card'><h2>知识星球主题查询</h2><div class='controls'><input id='topic-keywords' type='text' placeholder='包含全部关键词，例如：深信服 翻倍'><button id='search-topics'>查询</button><button id='clear-topics' class='secondary'>清空</button></div><p id='topic-status' class='muted'></p><div id='topic-list'></div><div id='pager' class='pager'></div></section>
     <section class='card'><h2>关键词统计</h2><p class='muted'>“未来 1 月”指发布事件日后的 20 个交易日；只有完整取得 20 个交易日行情的样本才参与涨幅≥10%排行。</p><div class='controls'><input id='stat-keyword' placeholder='关键词'><input id='stat-stock' placeholder='股票代码'><input id='stat-from' type='date'><input id='stat-to' type='date'><button id='load-stats'>刷新统计</button><a class='button' href='/api/export/keywords.csv'>导出 CSV</a></div><table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来1月平均收益</th><th>1月涨幅≥10%比例</th><th>有效样本</th></tr></thead><tbody id='stat-rows'></tbody></table></section>
+    <section class='card'><h2>荐股强调词分析</h2><p class='muted'>只识别“继续看好、超预期、翻倍空间、强 Call、务必重视、重点推荐”等荐股强度和上涨空间表达，不把股票名称、行业名词当作关键词。默认至少 10 个有效样本才参与排行；结果是历史相关性，不是因果关系。</p><div class='controls'><input id='auto-filter' placeholder='筛选强调词，例如：重点推荐'><button id='discover-auto'>重新扫描强调词</button><button id='load-auto' class='secondary'>刷新结果</button></div><p id='auto-status' class='muted'></p><table><thead><tr><th>强调词</th><th>出现主题</th><th>有效样本</th><th>上涨次数</th><th>上涨比例</th><th>平均20日收益</th><th>相对基准提升</th><th>按股票去重上涨率</th><th>代表股票</th></tr></thead><tbody id='auto-rows'></tbody></table></section>
     <dialog id='topic-modal'><div class='modal-head'><div><strong id='modal-title'></strong><div id='modal-meta' class='meta'></div></div><button id='close-modal' class='close' aria-label='关闭'>×</button></div><div id='modal-body' class='modal-body'></div></dialog>
+    <dialog id='auto-modal'><div class='modal-head'><div><strong id='auto-modal-title'></strong><div id='auto-modal-meta' class='meta'></div></div><button id='close-auto-modal' class='close' aria-label='关闭'>×</button></div><div id='auto-modal-body' class='modal-body'></div></dialog>
     <script>
     const state={page:1,pageSize:20}; const $=id=>document.getElementById(id);
     const bjt=value=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(value));
     const add=(parent,tag,text,className='')=>{const el=document.createElement(tag);el.textContent=text;if(className)el.className=className;parent.append(el);return el};
     const tags=(parent,values)=>values.forEach(value=>add(parent,'span','#'+value,'tag'));
     const preview=value=>value.replace(/\s+/g,' ').slice(0,180)+(value.replace(/\s+/g,' ').length>180?'…':'');
+    async function loadQuoteStatus(){const button=$('load-quote-status');button.disabled=true;$('quote-status').className='muted';$('quote-status').textContent='正在查询…';try{const res=await fetch('/api/quotes/sync-status');const data=await res.json();if(!res.ok)throw new Error(data.detail||'进度查询失败');$('quote-progress').replaceChildren();$('quote-summary').replaceChildren();if(!data.checkpoint){$('quote-status').textContent='尚未找到全量行情同步断点';$('quote-detail').textContent=`数据库已有 ${data.database.stocks_with_quotes} 只股票的行情，共 ${data.database.quote_rows} 条`;return}const bar=document.createElement('div');bar.className='progress';const fill=document.createElement('span');fill.style.width=data.progress.percent+'%';bar.append(fill);$('quote-progress').append(bar);[[`${data.progress.completed} / ${data.progress.total}`,'任务已处理股票'],[data.database.stocks_with_quotes,'数据库已有行情股票'],[data.database.quote_rows,'数据库行情记录'],[data.progress.failed,'本轮失败股票']].forEach(([value,label])=>{const box=document.createElement('div');add(box,'strong',String(value));add(box,'span',label,'muted');$('quote-summary').append(box)});$('quote-status').textContent=`${data.progress.status_text}，完成 ${data.progress.percent.toFixed(2)}%`;$('quote-detail').textContent=`同步范围：${data.progress.start_date||'-'} 至 ${data.progress.end_date||'-'}；数据库行情范围：${data.database.min_date||'-'} 至 ${data.database.max_date||'-'}；断点更新：${bjt(data.progress.updated_at)}`}catch(error){$('quote-status').textContent=error.message;$('quote-status').className='error'}finally{button.disabled=false}}
     async function loadTopics(page=1){const q=new URLSearchParams({page:String(page),page_size:String(state.pageSize)});const keywords=$('topic-keywords').value.trim();if(keywords)q.set('keywords',keywords);const res=await fetch('/api/topics/search?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'查询失败');state.page=data.page;const list=$('topic-list');list.replaceChildren();$('topic-status').className='muted';$('topic-status').textContent=`共 ${data.total} 条${data.keywords.length?'；同时包含：'+data.keywords.join('、'):''}`;if(!data.items.length){add(list,'p','没有符合条件的主题。','muted')}data.items.forEach(topic=>{const row=document.createElement('article');row.className='topic';const title=add(row,'div',topic.title||'（无标题）','topic-title');title.onclick=()=>showTopic(topic.topic_id).catch(showError);add(row,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(row,'div',preview(topic.content),'preview');tags(row,topic.tags||[]);list.append(row)});const pager=$('pager');pager.replaceChildren();const pages=Math.max(1,Math.ceil(data.total/data.page_size));const prev=add(pager,'button','上一页','secondary');prev.disabled=data.page<=1;prev.onclick=()=>loadTopics(data.page-1).catch(showError);add(pager,'span',`第 ${data.page} / ${pages} 页`,'muted');const pageInput=document.createElement('input');pageInput.type='number';pageInput.min='1';pageInput.max=String(pages);pageInput.value=String(data.page);pageInput.style.width='64px';pageInput.setAttribute('aria-label','跳转页码');pager.append(pageInput);const jump=add(pager,'button','跳转','secondary');const go=()=>{const target=Number(pageInput.value);if(!Number.isInteger(target)||target<1||target>pages){throw new Error(`请输入 1 到 ${pages} 的页码`)}return loadTopics(target)};jump.onclick=()=>go().catch(showError);pageInput.onkeydown=event=>{if(event.key==='Enter')go().catch(showError)};const next=add(pager,'button','下一页','secondary');next.disabled=data.page>=pages;next.onclick=()=>loadTopics(data.page+1).catch(showError)}
     async function showTopic(id){const res=await fetch('/api/topics/'+encodeURIComponent(id));const topic=await res.json();if(!res.ok)throw new Error(topic.detail||'无法读取主题');$('modal-title').textContent=topic.title||'（无标题）';$('modal-meta').textContent=`知识星球发布时间：${bjt(topic.published_at)} · ${topic.author||'未知作者'}`;const body=$('modal-body');body.replaceChildren();tags(body,topic.tags||[]);add(body,'div',topic.content||'（无正文）','preview');const details=document.createElement('div');details.className='details';add(details,'div','已识别股票：'+(topic.stocks.map(x=>`${x.code} ${x.name}`.trim()).join('、')||'无'));add(details,'div','已识别关键词：'+(topic.keywords.map(x=>x.keyword).join('、')||'无'));body.append(details);$('topic-modal').showModal()}
     async function loadStats(){const q=new URLSearchParams();[['stat-keyword','keyword'],['stat-stock','stock_code'],['stat-from','start_date'],['stat-to','end_date']].forEach(([id,key])=>{const value=$(id).value;if(value)q.set(key,value)});const res=await fetch('/api/stats/keywords?'+q);const data=await res.json();const rows=$('stat-rows');rows.replaceChildren();data.forEach(item=>{const row=document.createElement('tr');[item.keyword,item.topic_count,item.stock_count,item.avg_return_20d==null?'-':(item.avg_return_20d*100).toFixed(2)+'%',item.rise_rate_10pct_20d==null?'-':(item.rise_rate_10pct_20d*100).toFixed(2)+'%',`${item.eligible_count_20d} / ${item.sample_sufficient?'充足':'不足10篇'}`].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
-    $('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);loadTopics().catch(showError);loadStats().catch(showError);
+    async function loadAutoKeywords(){const q=new URLSearchParams();const filter=$('auto-filter').value.trim();if(filter)q.set('keyword',filter);const res=await fetch('/api/stats/auto-keywords?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'自动关键词查询失败');const ranked=data.filter(item=>item.sample_sufficient);const rows=$('auto-rows');rows.replaceChildren();$('auto-status').className='muted';$('auto-status').textContent=data.length?`共 ${data.length} 个候选，显示 ${ranked.length} 个样本充足（有效样本≥10）`:'暂无自动关键词，请点击“扫描并更新关键词”';if(!ranked.length)return;ranked.forEach(item=>{const row=document.createElement('tr');const word=document.createElement('button');word.className='secondary';word.textContent=item.keyword;word.onclick=()=>showAutoKeyword(item.keyword_id).catch(showAutoError);const wordCell=document.createElement('td');wordCell.append(word);row.append(wordCell);[item.topic_count,item.eligible_count_20d,item.success_count_20d,item.rise_rate_10pct_20d==null?'-':(item.rise_rate_10pct_20d*100).toFixed(2)+'%',item.avg_return_20d==null?'-':(item.avg_return_20d*100).toFixed(2)+'%',item.uplift_vs_baseline==null?'-':(item.uplift_vs_baseline*100).toFixed(2)+'%',item.dedup_stock_rise_rate_20d==null?'-':(item.dedup_stock_rise_rate_20d*100).toFixed(2)+'%（'+item.dedup_stock_count+'只）',item.representative_stocks.map(x=>`${x.name||x.code}(${x.topics})`).join('、')||'-'].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
+    async function discoverAutoKeywords(){const button=$('discover-auto');button.disabled=true;$('auto-status').className='muted';$('auto-status').textContent='正在清理旧结果并扫描荐股强调词，数据量较大时需要一些时间…';try{const res=await fetch('/api/analyze/discover-keywords',{method:'POST'});const data=await res.json();if(!res.ok)throw new Error(data.detail||'强调词扫描失败');$('auto-status').textContent=`扫描 ${data.topics_scanned} 篇主题，发现 ${data.candidate_keywords} 个强调词，建立 ${data.links_added} 条关联`;await loadAutoKeywords()}finally{button.disabled=false}}
+    async function showAutoKeyword(id){const res=await fetch('/api/stats/auto-keywords/'+encodeURIComponent(id));const data=await res.json();if(!res.ok)throw new Error(data.detail||'无法读取关键词详情');$('auto-modal-title').textContent=`关键词：${data.keyword}`;$('auto-modal-meta').textContent=`展示最近 ${data.topics.length} 篇相关主题`;$('auto-modal-body').replaceChildren();if(!data.topics.length){add($('auto-modal-body'),'p','没有相关主题。','muted')}data.topics.forEach(topic=>{const block=document.createElement('article');block.className='topic';add(block,'div',topic.title||'（无标题）','topic-title');add(block,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(block,'div','出现上下文：'+(topic.context||'—'),'preview');add(block,'div','关联股票：'+(topic.stocks.map(x=>`${x.code} ${x.name}`.trim()).join('、')||'无'),'meta');const returns=topic.returns.map(x=>`${x.code} 20日收益 ${x.return_20d==null?'-':(x.return_20d*100).toFixed(2)+'%'}，最高收盘 ${x.max_return_20d==null?'-':(x.max_return_20d*100).toFixed(2)+'%'}`).join('；');add(block,'div','行情结果：'+(returns||'无完整20日行情'),'meta');$('auto-modal-body').append(block)});$('auto-modal').showModal()}
+    $('load-quote-status').onclick=loadQuoteStatus;$('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}function showAutoError(error){$('auto-status').textContent=error.message;$('auto-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);$('discover-auto').onclick=()=>discoverAutoKeywords().catch(showAutoError);$('load-auto').onclick=()=>loadAutoKeywords().catch(showAutoError);$('auto-filter').onkeydown=event=>{if(event.key==='Enter')loadAutoKeywords().catch(showAutoError)};$('close-auto-modal').onclick=()=>$('auto-modal').close();loadQuoteStatus();loadTopics().catch(showError);loadStats().catch(showError);loadAutoKeywords().catch(showAutoError);
     </script></body></html>""")
 
 
@@ -172,7 +198,8 @@ def sync_stock_master(db: Session = Depends(db_session)):
             stock.stock_name = row["name"]
             updated += 1
     db.commit()
-    return {"provider": "akshare", "total": len(rows), "imported": imported, "updated": updated}
+    return {"provider": "akshare", "total": len(rows), "imported": imported, "updated": updated,
+            "codes": [row["code"] for row in rows]}
 
 
 @app.post("/api/topics/reanalyze-stocks")
@@ -287,6 +314,57 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
             "invalid_rows": invalid_rows, "failed": len(failed_codes), "failed_codes": failed_codes}
 
 
+@app.get("/api/quotes/sync-status")
+def quote_sync_status(db: Session = Depends(db_session)):
+    """Report full-market checkpoint progress and actual quote coverage."""
+    checkpoint = latest_quote_checkpoint()
+    total_stocks = db.scalar(select(func.count()).select_from(Stock)) or 0
+    database_row = db.execute(
+        select(func.count(func.distinct(StockDailyQuote.stock_id)),
+               func.count(StockDailyQuote.id),
+               func.min(StockDailyQuote.trade_date),
+               func.max(StockDailyQuote.trade_date))
+        .where(StockDailyQuote.adjust_type == "qfq")
+    ).one()
+    result = {
+        "checkpoint": checkpoint is not None,
+        "database": {
+            "total_stocks": total_stocks,
+            "stocks_with_quotes": database_row[0] or 0,
+            "quote_rows": database_row[1] or 0,
+            "min_date": database_row[2],
+            "max_date": database_row[3],
+        },
+    }
+    if checkpoint is None:
+        return result
+
+    completed = len(set(checkpoint["completed_codes"]))
+    total = checkpoint.get("total") or total_stocks
+    failed = len(set(checkpoint.get("last_failed_codes") or []))
+    updated_at = checkpoint["updated_at"]
+    if total and completed >= total:
+        status, status_text = "completed", "已完成"
+    elif datetime.now(timezone.utc) - updated_at <= timedelta(minutes=3):
+        status, status_text = "running", "同步中"
+    else:
+        status, status_text = "paused", "已暂停，可从断点继续"
+    result["progress"] = {
+        "status": status,
+        "status_text": status_text,
+        "completed": completed,
+        "total": total,
+        "remaining": max(total - completed, 0),
+        "percent": round(completed * 100 / total, 2) if total else 0,
+        "failed": failed,
+        "start_date": checkpoint.get("start_date"),
+        "end_date": checkpoint.get("end_date"),
+        "updated_at": updated_at,
+        "state_file": checkpoint["state_file"],
+    }
+    return result
+
+
 @app.get("/api/quotes/history/{stock_code}")
 def quote_history(stock_code: str, limit: int = 500, adjust_type: str = "qfq",
                   db: Session = Depends(db_session)):
@@ -353,12 +431,47 @@ def analyze(db: Session = Depends(db_session)):
     return {"status": "ok"}
 
 
+@app.post("/api/analyze/discover-keywords")
+def discover_keywords_api(db: Session = Depends(db_session)):
+    """Rebuild outcomes, then extract recurring non-seed terms and persist links."""
+    try:
+        rebuild_returns(db)
+        result = discover_auto_keywords(db)
+        result["event_returns"] = db.scalar(select(func.count()).select_from(StockEventReturn)) or 0
+        db.commit()
+        return result
+    except Exception as exc:
+        db.rollback()
+        log.exception("荐股强调词扫描失败")
+        raise HTTPException(500, "自动关键词发现失败，请查看应用日志") from exc
+
+
 @app.get("/api/stats/keywords", response_model=list[KeywordStat])
 def stats(keyword: str | None = None, stock_code: str | None = None,
           start_date: date | None = None, end_date: date | None = None,
           db: Session = Depends(db_session)):
     return keyword_stats(db, keyword_filter=keyword, stock_code=stock_code,
                          start_date=start_date, end_date=end_date)
+
+
+@app.get("/api/stats/auto-keywords")
+def auto_keyword_stats(keyword: str | None = None, stock_code: str | None = None,
+                       min_samples: int = AUTO_KEYWORD_MIN_SAMPLES,
+                       db: Session = Depends(db_session)):
+    if min_samples < 1 or min_samples > 1000:
+        raise HTTPException(400, "min_samples must be between 1 and 1000")
+    return discovered_keyword_stats(db, keyword_filter=keyword, stock_code=stock_code,
+                                    min_samples=min_samples)
+
+
+@app.get("/api/stats/auto-keywords/{keyword_id}")
+def auto_keyword_detail(keyword_id: int, limit: int = 100, db: Session = Depends(db_session)):
+    if limit < 1 or limit > 200:
+        raise HTTPException(400, "limit must be between 1 and 200")
+    result = discovered_keyword_detail(db, keyword_id, limit=limit)
+    if not result:
+        raise HTTPException(404, "auto keyword not found")
+    return result
 
 
 @app.get("/api/export/keywords.csv", include_in_schema=True)

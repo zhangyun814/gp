@@ -5,3 +5,4 @@ __pycache__/
 data/*.csv
 data/zsxq-backfill-*.json
 data/quote-sync-state.json
+data/logs/

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zhangyun.planet-stock-analyzer.zsxq-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/Users/zhangyun/Library/Application Support/planet-stock-analyzer-zsxq/run_zsxq_sync.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>50</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>50</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>50</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>50</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>50</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>10</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
+        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>50</integer></dict>
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/launchd.stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>ZSXQ_LOG_DIR</key>
+        <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer</string>
+        <key>ZSXQ_LOG_FILE</key>
+        <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/zsxq-sync.log</string>
+        <key>ZSXQ_LOCK_DIR</key>
+        <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/.zsxq-sync.lock</string>
+        <key>ZSXQ_CLI</key>
+        <string>/usr/local/bin/zsxq-cli</string>
+    </dict>
+</dict>
+</plist>

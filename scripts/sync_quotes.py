@@ -44,6 +44,12 @@ def next_batch(codes: list[str], completed: set[str], size: int,
     return [code for code in codes if code not in completed and code not in excluded][:size]
 
 
+def state_for_run(state: dict, start_date: str, end_date: str, all_stocks: bool) -> dict:
+    expected = (start_date, end_date, all_stocks)
+    actual = (state.get("start_date"), state.get("end_date"), state.get("all_stocks"))
+    return state if actual == expected else {"completed_codes": []}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="同步主题关联股票的历史行情（支持断点续拉）")
     parser.add_argument("--app-url", default=DEFAULT_APP)
@@ -52,16 +58,28 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=10, help="每次请求的股票数")
     parser.add_argument("--batches", type=int, default=20, help="本次最多处理的批次数")
     parser.add_argument("--state-file", default="data/quote-sync-state.json")
+    parser.add_argument("--all-stocks", action="store_true", help="同步当前全部上市 A 股，而不只同步主题提及股票")
     args = parser.parse_args()
     if args.batch_size < 1 or args.batches < 1:
         parser.error("--batch-size 和 --batches 必须大于 0")
 
+    start_date, end_date = date.fromisoformat(args.start_date), date.fromisoformat(args.end_date)
+    if start_date > end_date:
+        parser.error("--start-date 不能晚于 --end-date")
+    if end_date > date.today():
+        parser.error("--end-date 不能晚于今天，未来行情尚未产生")
+
     state_path = Path(args.state_file)
-    state = load_state(state_path)
+    state = state_for_run(load_state(state_path), args.start_date, args.end_date, args.all_stocks)
     completed = set(state.get("completed_codes", []))
-    codes = read_json(f"{args.app_url.rstrip('/')}/api/stocks/mentioned")
+    if args.all_stocks:
+        master = read_json(f"{args.app_url.rstrip('/')}/api/stocks/sync-master", {})
+        codes = master.get("codes") if isinstance(master, dict) else None
+    else:
+        codes = read_json(f"{args.app_url.rstrip('/')}/api/stocks/mentioned")
     if not isinstance(codes, list):
         raise RuntimeError("应用没有返回股票代码列表")
+    state["total"] = len(codes)
     imported = skipped = no_data = invalid_rows = batches = 0
     failed_codes: set[str] = set()
     attempted: set[str] = set()
@@ -82,6 +100,7 @@ def main() -> int:
         completed.update(set(batch) - batch_failed)
         state["completed_codes"] = sorted(completed)
         state["start_date"], state["end_date"] = args.start_date, args.end_date
+        state["all_stocks"] = args.all_stocks
         state["last_failed_codes"] = sorted(failed_codes)
         save_state(state_path, state)
         batches += 1

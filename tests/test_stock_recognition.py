@@ -5,7 +5,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.analyzer import extract_topic, return_metrics
+from app.analyzer import candidate_keywords, extract_topic, return_metrics
 from app.db import Base
 from app.models import PlanetTopic, Stock, TopicStock
 
@@ -37,6 +37,17 @@ class StockRecognitionTest(unittest.TestCase):
 
         self.assertIsNone(return_metrics(10, [Quote(11)] * 19)["max_return_20d"])
         self.assertEqual(return_metrics(Decimal("10"), [Quote(11)] * 20)["max_return_20d"], Decimal("0.1"))
+
+    def test_auto_keywords_extract_emphasis_phrases_not_industry_nouns(self):
+        terms = candidate_keywords(
+            "深信服继续看好，业绩超预期，翻10倍空间，强 CALL，务必重视，重点推荐，液冷订单",
+            {"深信服"},
+        )
+        self.assertTrue({"继续看好", "超预期", "翻10倍空间", "强call", "务必重视", "重点推荐"} <= terms)
+        self.assertNotIn("深信服", terms)
+        self.assertNotIn("液冷", terms)
+        self.assertNotIn("订单", terms)
+        self.assertNotIn("0倍空间", terms)
 
 
 if __name__ == "__main__":

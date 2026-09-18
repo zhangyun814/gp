@@ -64,6 +64,30 @@ rm data/zsxq-backfill-2026.json
 
 同步脚本在主机上调用官方 CLI，再把脱敏后的主题字段 POST 到本机 `/api/topics/sync/zsxq`；容器内不会接触 Keychain 或 Token。
 
+### 项目级每 10 分钟自动同步（Mac launchd）
+
+这是项目自己的定时任务，不依赖 Codex 对话，也不占用 Codex 用量。它在登录用户的 Mac 后台每天 06:00–11:50 每 10 分钟执行一次主机同步脚本，12:00 之后不执行；脚本使用 `zsxq-cli` 的 Keychain OAuth，并把结果写入 `~/Library/Logs/planet-stock-analyzer/zsxq-sync.log`。由于 macOS 默认限制后台进程访问 `~/Documents`，安装脚本会把同步脚本和解析模块复制到 `~/Library/Application Support/planet-stock-analyzer-zsxq` 后运行；修改同步脚本后重新执行安装命令即可更新运行副本。
+
+```bash
+cd /Users/zhangyun/Documents/code/planet-stock-analyzer
+sh scripts/install_zsxq_launchd.sh
+```
+
+查看任务状态和最近日志：
+
+```bash
+launchctl print gui/$(id -u)/com.zhangyun.planet-stock-analyzer.zsxq-sync
+tail -f ~/Library/Logs/planet-stock-analyzer/zsxq-sync.log
+```
+
+停止自动同步：
+
+```bash
+sh scripts/uninstall_zsxq_launchd.sh
+```
+
+Mac 需要保持开机并登录用户会话；Docker 的 `app` 和 `postgres` 也需要保持运行。
+
 ## 一个月涨幅关键词统计
 
 “未来 1 月”按主题事件日后的 20 个交易日计算：期间最高收盘价相对事件日收盘价涨幅达到 10% 即标记为成功。只有完整取得 20 个交易日行情的主题会进入该排行；它是历史相关性统计，不是投资建议。
@@ -82,6 +106,10 @@ curl -X POST http://localhost:8000/api/analyze/rebuild
 
 刷新首页的“关键词统计”，即可按“未来 1 月涨幅≥10%比例”查看排行。
 
+### 荐股强调词分析
+
+首页只识别“继续看好、超预期、翻倍空间、强 Call、务必重视、重点推荐”等荐股强度和上涨空间表达，不再把股票名称、行业名词或普通高频词当成候选。点击“重新扫描强调词”会清理旧的自动结果、重算已有行情的 20 个交易日结果，再建立强调词关联；只有至少 10 个完整行情样本的词才进入默认排行。点击表格中的强调词可查看关联主题、原文上下文、股票和实际涨幅；“按股票去重上涨率”用于避免同一股票被多篇主题重复推荐造成偏差。所有结果仅代表历史相关性，不代表这些表达导致上涨。
+
 行情由 Docker 中的 app 访问外网。Mac 使用 Clash 时，Compose 默认通过 `host.docker.internal:7897` 连接宿主机代理；如果 Clash 端口不同，可在重启时覆盖：
 
 ```bash
@@ -93,6 +121,13 @@ docker compose up -d app
 行情接口会优先使用 AKShare 东方财富数据，接口被代理断开时自动切换到 AKShare 新浪历史行情。
 
 行情按交易日保存：周末、节假日、停牌或接口没有返回的日期会直接跳过，不会补造价格。单只股票或单行数据读取失败也不会中断整批同步；失败代码会保留在断点的 `last_failed_codes` 中，下一次运行时继续尝试。
+
+同步当前全部上市 A 股时使用 `--all-stocks`。脚本会先刷新 AKShare 股票名单，再按断点下载；日期范围或同步模式变化时会自动启用新断点，避免误把旧任务当成已完成：
+
+```bash
+python3 scripts/sync_quotes.py --all-stocks --start-date 2026-01-01 --end-date 2026-09-17 \
+  --batch-size 10 --batches 600 --state-file data/quote-sync-all-2026-to-20260917.json
+```
 
 ## 日常操作命令
 
