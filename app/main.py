@@ -3,6 +3,9 @@ import io
 import json
 import logging
 import re
+import threading
+import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,14 +13,15 @@ from fastapi import Depends, FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
-from .analyzer import (AUTO_KEYWORD_MIN_SAMPLES, discover_auto_keywords, discovered_keyword_detail,
-                       discovered_keyword_stats, extract_topic, keyword_stats, rebuild_returns)
+from .analyzer import (AUTO_KEYWORD_MIN_SAMPLES, AUTO_KEYWORD_CATEGORY, MANUAL_KEYWORD_CATEGORY,
+                       discover_auto_keywords, discovered_keyword_detail, discovered_keyword_stats,
+                       ensure_manual_keywords, extract_topic, keyword_stats, rebuild_returns)
 from .db import SessionLocal, init_db
 from .market import fetch_akshare_quotes, fetch_akshare_stock_master
 from .models import (Keyword, PlanetCircle, PlanetTopic, Stock, StockDailyQuote,
                      StockEventReturn, SyncJob, TopicKeyword, TopicStock)
-from .schemas import (KeywordStat, QuoteSyncIn, TopicAnnotationsIn, TopicImportResult, TopicIn,
-                      ZsxqSyncIn, ZsxqSyncResult)
+from .schemas import (KeywordStat, ManualKeywordActiveIn, ManualKeywordIn, QuoteSyncIn,
+                      TopicAnnotationsIn, TopicImportResult, TopicIn, ZsxqSyncIn, ZsxqSyncResult)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("planet-stock")
@@ -26,16 +30,60 @@ log = logging.getLogger("planet-stock")
 @asynccontextmanager
 async def lifespan(_app):
     init_db()
+    db = SessionLocal()
+    try:
+        ensure_manual_keywords(db)
+    finally:
+        db.close()
     yield
 
 
 app = FastAPI(title="知识星球观点分析", version="0.1.0", lifespan=lifespan)
 
 KEYWORD_SPLIT_RE = re.compile(r"[\s,，]+")
+MARKETS = {"all", "main", "gem", "star", "bse"}
+PERIODS = {"1d", "3d", "5d", "10d", "20d", "60d", "mtd", "ytd"}
+
+
+def market_for_code(code: str) -> str:
+    code = (code or "").strip().upper()
+    if code.startswith("300"):
+        return "创业板"
+    if code.startswith("688"):
+        return "科创板"
+    if code.startswith(("4", "8")):
+        return "北交所"
+    if code.startswith(("600", "601", "603", "605", "000", "001", "002", "003")):
+        return "主板"
+    return "其他"
+
+
+def market_clause(column, market: str):
+    if market == "all":
+        return None
+    prefixes = {
+        "main": ("600%", "601%", "603%", "605%", "000%", "001%", "002%", "003%"),
+        "gem": ("300%",),
+        "star": ("688%",),
+        "bse": ("4%", "8%"),
+    }.get(market)
+    return or_(*(column.like(prefix) for prefix in prefixes))
 
 
 def split_keywords(value: str) -> list[str]:
     return list(dict.fromkeys(term for term in KEYWORD_SPLIT_RE.split(value.strip()) if term))
+
+
+def normalize_manual_keyword(value: str) -> str:
+    term = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value or "").strip())
+    if not term:
+        raise HTTPException(400, "keyword cannot be empty")
+    return term
+
+
+def manual_keyword_item(keyword: Keyword, topic_counts: dict[int, int]) -> dict:
+    return {"id": keyword.id, "keyword": keyword.keyword, "active": keyword.active,
+            "topic_count": topic_counts.get(keyword.id, 0)}
 
 
 def topic_summary(topic: PlanetTopic) -> dict:
@@ -62,6 +110,158 @@ def latest_quote_checkpoint(data_dir: Path = Path("/data")) -> dict | None:
     return None
 
 
+# In-container resume worker: reads the newest /data checkpoint and continues
+# the full-market sync in small batches, so the web page can restart the run
+# without a host terminal command.
+_quote_sync_lock = threading.Lock()
+
+
+def _save_quote_checkpoint(path: Path, state: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _fetch_quotes_with_retry(stock_code: str, start_date: date, end_date: date,
+                             adjust_type: str, max_attempts: int = 3) -> list[dict]:
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fetch_akshare_quotes(stock_code, start_date, end_date, adjust_type)
+        except Exception as exc:
+            last_error = exc
+            log.warning("quote fetch failed code=%s attempt=%d/%d error=%s",
+                        stock_code, attempt, max_attempts, type(exc).__name__)
+            if attempt < max_attempts:
+                time.sleep(2 ** (attempt - 1))
+    assert last_error is not None
+    raise last_error
+
+
+def _store_quote_rows(db: Session, stock_code: str, rows: list[dict], adjust_type: str) -> dict[str, int]:
+    stock = db.scalar(select(Stock).where(Stock.stock_code == stock_code))
+    if not stock:
+        stock = Stock(stock_code=stock_code, exchange="SH" if stock_code.startswith("6") else "SZ")
+        db.add(stock)
+        db.flush()
+
+    prepared: list[tuple[date, dict]] = []
+    invalid = 0
+    for row in rows:
+        try:
+            trade_date = date.fromisoformat(row["date"])
+        except (KeyError, TypeError, ValueError):
+            invalid += 1
+            continue
+        prepared.append((trade_date, row))
+    existing = set(db.scalars(select(StockDailyQuote.trade_date).where(
+        StockDailyQuote.stock_id == stock.id,
+        StockDailyQuote.adjust_type == adjust_type,
+        StockDailyQuote.trade_date.in_([item[0] for item in prepared]),
+    ))) if prepared else set()
+    imported = skipped = 0
+    for trade_date, row in prepared:
+        if trade_date in existing:
+            skipped += 1
+            continue
+        db.add(StockDailyQuote(stock_id=stock.id, trade_date=trade_date,
+                               open=row["open"], high=row["high"], low=row["low"], close=row["close"],
+                               volume=row["volume"], amount=row["amount"],
+                               turnover_rate=row["turnover_rate"], adjust_type=adjust_type))
+        existing.add(trade_date)
+        imported += 1
+    return {"imported": imported, "skipped": skipped, "invalid_rows": invalid}
+
+
+def _resume_quote_sync_worker(state_file: str, start_date: str, end_date: str,
+                              batch_size: int = 10, max_batches: int = 600, max_attempts: int = 3):
+    db = SessionLocal()
+    path = Path("/data") / state_file
+    state: dict = {}
+    try:
+        if not path.exists():
+            return
+        state = json.loads(path.read_text(encoding="utf-8"))
+        completed = set(state.get("completed_codes") or [])
+        codes = [row[0] for row in db.execute(
+            select(Stock.stock_code).order_by(Stock.stock_code)).all()]
+        state["total"] = len(codes)
+        state["start_date"], state["end_date"], state["all_stocks"] = start_date, end_date, True
+        state["status"] = "running"
+        state["started_at"] = datetime.now(timezone.utc).isoformat()
+        state["analysis_status"] = "pending"
+        _save_quote_checkpoint(path, state)
+        failed_codes: set[str] = set()
+        failure_reasons: dict[str, str] = {}
+        imported = skipped = no_data = invalid_rows = batches = 0
+        log.info("quote resume started state_file=%s completed=%d total=%d",
+                 state_file, len(completed), len(codes))
+        pending = [code for code in codes if code not in completed]
+        for index in range(0, min(len(pending), batch_size * max_batches), batch_size):
+            batch = pending[index:index + batch_size]
+            for code in batch:
+                try:
+                    rows = _fetch_quotes_with_retry(code, date.fromisoformat(start_date),
+                                                    date.fromisoformat(end_date), "qfq", max_attempts)
+                except Exception as exc:
+                    failed_codes.add(code)
+                    failure_reasons[code] = type(exc).__name__
+                    continue
+                if not rows:
+                    no_data += 1
+                counts = _store_quote_rows(db, code, rows, "qfq") if rows else {
+                    "imported": 0, "skipped": 0, "invalid_rows": 0,
+                }
+                imported += counts["imported"]
+                skipped += counts["skipped"]
+                invalid_rows += counts["invalid_rows"]
+                completed.add(code)
+            db.commit()
+            batches += 1
+            state["completed_codes"] = sorted(completed)
+            state["last_failed_codes"] = sorted(failed_codes)
+            state["failure_reasons"] = failure_reasons
+            state["imported"], state["skipped"] = imported, skipped
+            state["no_data"], state["invalid_rows"] = no_data, invalid_rows
+            _save_quote_checkpoint(path, state)
+            if batches % 10 == 0:
+                log.info("quote resume progress completed=%d total=%d", len(completed), len(codes))
+
+        unattempted = set(codes) - completed - failed_codes
+        if unattempted:
+            state["status"] = "paused"
+        else:
+            state["status"] = "analyzing"
+            state["analysis_status"] = "running"
+            _save_quote_checkpoint(path, state)
+            rebuild_returns(db)
+            db.commit()
+            state["analysis_status"] = "completed"
+            state["analysis_event_returns"] = db.scalar(
+                select(func.count()).select_from(StockEventReturn)) or 0
+            state["analysis_completed_at"] = datetime.now(timezone.utc).isoformat()
+            state["status"] = "completed_with_failures" if failed_codes else "completed"
+            state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _save_quote_checkpoint(path, state)
+        log.info("quote resume finished status=%s completed=%d total=%d failed=%d",
+                 state["status"], len(completed), len(codes), len(failed_codes))
+    except Exception as exc:
+        db.rollback()
+        if state:
+            state["status"] = "failed"
+            state["error"] = type(exc).__name__
+            if state.get("analysis_status") == "running":
+                state["analysis_status"] = "failed"
+            try:
+                _save_quote_checkpoint(path, state)
+            except OSError:
+                pass
+        log.exception("quote resume worker crashed")
+    finally:
+        db.close()
+        _quote_sync_lock.release()
+
+
 @app.get("/", include_in_schema=False)
 def home():
     return HTMLResponse(r"""<!doctype html><html lang='zh-CN'><meta charset='utf-8'>
@@ -69,26 +269,32 @@ def home():
     <style>
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px auto;max-width:1180px;color:#17233b;background:#f7f9fc}h1,h2{margin:0 0 14px}.card{background:#fff;border:1px solid #e5eaf2;border-radius:12px;padding:22px;margin:18px 0;box-shadow:0 1px 2px #dfe6f033}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input{padding:10px;border:1px solid #cbd5e1;border-radius:7px;font-size:14px}input[type=text]{min-width:280px}button,.button{padding:10px 15px;border:0;border-radius:7px;background:#1677ff;color:#fff;cursor:pointer;font-size:14px}button.secondary{background:#e8eef8;color:#29415f}.muted{color:#64748b;font-size:13px}.progress{height:10px;background:#e8eef8;border-radius:8px;overflow:hidden;margin:14px 0}.progress>span{display:block;height:100%;background:#1677ff}.summary{display:flex;gap:28px;flex-wrap:wrap}.summary strong{display:block;font-size:22px;margin-bottom:4px}.topic{padding:16px 0;border-bottom:1px solid #edf1f5}.topic:last-child{border-bottom:0}.topic-title{font-size:16px;font-weight:650;color:#17233b;cursor:pointer}.topic-title:hover{color:#1677ff}.meta{font-size:13px;color:#64748b;margin:7px 0}.preview{white-space:pre-wrap;line-height:1.6;color:#334155}.tag{display:inline-block;margin:3px 5px 0 0;padding:2px 7px;border-radius:12px;background:#e9f2ff;color:#2769b6;font-size:12px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{padding:9px;border-bottom:1px solid #e8edf3;text-align:left}.pager{display:flex;gap:10px;align-items:center;margin-top:16px}dialog{border:0;border-radius:12px;width:min(780px,90vw);max-height:82vh;box-shadow:0 16px 50px #17233b66;padding:0}dialog::backdrop{background:#17233b77}.modal-head{display:flex;justify-content:space-between;gap:20px;padding:20px 22px;border-bottom:1px solid #e8edf3}.modal-body{padding:20px 22px;white-space:pre-wrap;line-height:1.7;overflow:auto;max-height:62vh}.close{background:transparent;color:#475569;font-size:22px;padding:0}.details{margin-top:16px;padding-top:12px;border-top:1px solid #e8edf3}.error{color:#c2410c}</style>
     <body><h1>知识星球股票观点分析</h1><p class='muted'>主题按知识星球发布时间倒序；数据库保存的是接口返回的发布时间，不是本地同步时间。 · <a href='/kline'>打开 K 线查询</a></p>
-    <section class='card'><h2>行情同步进度</h2><div class='controls'><button id='load-quote-status'>刷新进度</button><span id='quote-status' class='muted'></span></div><div id='quote-progress'></div><div id='quote-summary' class='summary'></div><p id='quote-detail' class='muted'></p></section>
+    <section class='card'><h2>行情同步进度</h2><p class='muted'>任务在后台运行；单只股票失败会自动重试 3 次，任务处理完成后自动重算收益分析。</p><div class='controls'><button id='load-quote-status'>刷新进度</button><button id='resume-quote-sync'>后台继续/重试</button><span id='quote-status' class='muted'></span></div><div id='quote-progress'></div><div id='quote-summary' class='summary'></div><p id='quote-detail' class='muted'></p></section>
     <section class='card'><h2>知识星球主题查询</h2><div class='controls'><input id='topic-keywords' type='text' placeholder='包含全部关键词，例如：深信服 翻倍'><button id='search-topics'>查询</button><button id='clear-topics' class='secondary'>清空</button></div><p id='topic-status' class='muted'></p><div id='topic-list'></div><div id='pager' class='pager'></div></section>
     <section class='card'><h2>关键词统计</h2><p class='muted'>“未来 1 月”指发布事件日后的 20 个交易日；只有完整取得 20 个交易日行情的样本才参与涨幅≥10%排行。</p><div class='controls'><input id='stat-keyword' placeholder='关键词'><input id='stat-stock' placeholder='股票代码'><input id='stat-from' type='date'><input id='stat-to' type='date'><button id='load-stats'>刷新统计</button><a class='button' href='/api/export/keywords.csv'>导出 CSV</a></div><table><thead><tr><th>关键词</th><th>主题数</th><th>股票数</th><th>未来1月平均收益</th><th>1月涨幅≥10%比例</th><th>有效样本</th></tr></thead><tbody id='stat-rows'></tbody></table></section>
+    <section class='card'><h2>人工关键词词库</h2><p class='muted'>新增和修改的词会用于后续同步主题；停用只停止后续识别，历史关联仍保留。</p><div class='controls'><input id='manual-keyword' placeholder='例如：超预期、重点推荐'><button id='add-manual-keyword'>新增关键词</button><button id='load-manual-keywords' class='secondary'>刷新词库</button></div><p id='manual-status' class='muted'></p><table><thead><tr><th>关键词</th><th>状态</th><th>已关联主题</th><th>操作</th></tr></thead><tbody id='manual-rows'></tbody></table></section>
     <section class='card'><h2>荐股强调词分析</h2><p class='muted'>只识别“继续看好、超预期、翻倍空间、强 Call、务必重视、重点推荐”等荐股强度和上涨空间表达，不把股票名称、行业名词当作关键词。默认至少 10 个有效样本才参与排行；结果是历史相关性，不是因果关系。</p><div class='controls'><input id='auto-filter' placeholder='筛选强调词，例如：重点推荐'><button id='discover-auto'>重新扫描强调词</button><button id='load-auto' class='secondary'>刷新结果</button></div><p id='auto-status' class='muted'></p><table><thead><tr><th>强调词</th><th>出现主题</th><th>有效样本</th><th>上涨次数</th><th>上涨比例</th><th>平均20日收益</th><th>相对基准提升</th><th>按股票去重上涨率</th><th>代表股票</th></tr></thead><tbody id='auto-rows'></tbody></table></section>
     <dialog id='topic-modal'><div class='modal-head'><div><strong id='modal-title'></strong><div id='modal-meta' class='meta'></div></div><button id='close-modal' class='close' aria-label='关闭'>×</button></div><div id='modal-body' class='modal-body'></div></dialog>
     <dialog id='auto-modal'><div class='modal-head'><div><strong id='auto-modal-title'></strong><div id='auto-modal-meta' class='meta'></div></div><button id='close-auto-modal' class='close' aria-label='关闭'>×</button></div><div id='auto-modal-body' class='modal-body'></div></dialog>
     <script>
-    const state={page:1,pageSize:20}; const $=id=>document.getElementById(id);
+    const state={page:1,pageSize:20,quoteTimer:null}; const $=id=>document.getElementById(id);
     const bjt=value=>new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(value));
     const add=(parent,tag,text,className='')=>{const el=document.createElement(tag);el.textContent=text;if(className)el.className=className;parent.append(el);return el};
     const tags=(parent,values)=>values.forEach(value=>add(parent,'span','#'+value,'tag'));
     const preview=value=>value.replace(/\s+/g,' ').slice(0,180)+(value.replace(/\s+/g,' ').length>180?'…':'');
-    async function loadQuoteStatus(){const button=$('load-quote-status');button.disabled=true;$('quote-status').className='muted';$('quote-status').textContent='正在查询…';try{const res=await fetch('/api/quotes/sync-status');const data=await res.json();if(!res.ok)throw new Error(data.detail||'进度查询失败');$('quote-progress').replaceChildren();$('quote-summary').replaceChildren();if(!data.checkpoint){$('quote-status').textContent='尚未找到全量行情同步断点';$('quote-detail').textContent=`数据库已有 ${data.database.stocks_with_quotes} 只股票的行情，共 ${data.database.quote_rows} 条`;return}const bar=document.createElement('div');bar.className='progress';const fill=document.createElement('span');fill.style.width=data.progress.percent+'%';bar.append(fill);$('quote-progress').append(bar);[[`${data.progress.completed} / ${data.progress.total}`,'任务已处理股票'],[data.database.stocks_with_quotes,'数据库已有行情股票'],[data.database.quote_rows,'数据库行情记录'],[data.progress.failed,'本轮失败股票']].forEach(([value,label])=>{const box=document.createElement('div');add(box,'strong',String(value));add(box,'span',label,'muted');$('quote-summary').append(box)});$('quote-status').textContent=`${data.progress.status_text}，完成 ${data.progress.percent.toFixed(2)}%`;$('quote-detail').textContent=`同步范围：${data.progress.start_date||'-'} 至 ${data.progress.end_date||'-'}；数据库行情范围：${data.database.min_date||'-'} 至 ${data.database.max_date||'-'}；断点更新：${bjt(data.progress.updated_at)}`}catch(error){$('quote-status').textContent=error.message;$('quote-status').className='error'}finally{button.disabled=false}}
+    async function loadQuoteStatus(){clearTimeout(state.quoteTimer);const button=$('load-quote-status');button.disabled=true;$('quote-status').className='muted';$('quote-status').textContent='正在查询…';try{const res=await fetch('/api/quotes/sync-status');const data=await res.json();if(!res.ok)throw new Error(data.detail||'进度查询失败');$('quote-progress').replaceChildren();$('quote-summary').replaceChildren();if(!data.checkpoint){$('quote-status').textContent='尚未找到全量行情同步断点';$('quote-detail').textContent=`数据库已有 ${data.database.stocks_with_quotes} 只股票的行情，共 ${data.database.quote_rows} 条`;return}const bar=document.createElement('div');bar.className='progress';const fill=document.createElement('span');fill.style.width=data.progress.percent+'%';bar.append(fill);$('quote-progress').append(bar);[[`${data.progress.completed} / ${data.progress.total}`,'同步成功股票'],[data.database.stocks_with_quotes,'数据库已有行情股票'],[data.database.quote_rows,'数据库行情记录'],[data.progress.failed,'重试后仍失败股票']].forEach(([value,label])=>{const box=document.createElement('div');add(box,'strong',String(value));add(box,'span',label,'muted');$('quote-summary').append(box)});$('quote-status').textContent=`${data.progress.status_text}，处理 ${data.progress.percent.toFixed(2)}%`;const analysis=data.progress.analysis_status==='completed'?`；分析已自动重算（${data.progress.analysis_event_returns||0} 条事件）`:data.progress.analysis_status==='running'?'；正在自动重算分析':'';$('quote-detail').textContent=`同步范围：${data.progress.start_date||'-'} 至 ${data.progress.end_date||'-'}；数据库行情范围：${data.database.min_date||'-'} 至 ${data.database.max_date||'-'}；断点更新：${bjt(data.progress.updated_at)}${analysis}`;if(['running','analyzing'].includes(data.progress.status))state.quoteTimer=setTimeout(loadQuoteStatus,5000)}catch(error){$('quote-status').textContent=error.message;$('quote-status').className='error'}finally{button.disabled=false}}
     async function loadTopics(page=1){const q=new URLSearchParams({page:String(page),page_size:String(state.pageSize)});const keywords=$('topic-keywords').value.trim();if(keywords)q.set('keywords',keywords);const res=await fetch('/api/topics/search?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'查询失败');state.page=data.page;const list=$('topic-list');list.replaceChildren();$('topic-status').className='muted';$('topic-status').textContent=`共 ${data.total} 条${data.keywords.length?'；同时包含：'+data.keywords.join('、'):''}`;if(!data.items.length){add(list,'p','没有符合条件的主题。','muted')}data.items.forEach(topic=>{const row=document.createElement('article');row.className='topic';const title=add(row,'div',topic.title||'（无标题）','topic-title');title.onclick=()=>showTopic(topic.topic_id).catch(showError);add(row,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(row,'div',preview(topic.content),'preview');tags(row,topic.tags||[]);list.append(row)});const pager=$('pager');pager.replaceChildren();const pages=Math.max(1,Math.ceil(data.total/data.page_size));const prev=add(pager,'button','上一页','secondary');prev.disabled=data.page<=1;prev.onclick=()=>loadTopics(data.page-1).catch(showError);add(pager,'span',`第 ${data.page} / ${pages} 页`,'muted');const pageInput=document.createElement('input');pageInput.type='number';pageInput.min='1';pageInput.max=String(pages);pageInput.value=String(data.page);pageInput.style.width='64px';pageInput.setAttribute('aria-label','跳转页码');pager.append(pageInput);const jump=add(pager,'button','跳转','secondary');const go=()=>{const target=Number(pageInput.value);if(!Number.isInteger(target)||target<1||target>pages){throw new Error(`请输入 1 到 ${pages} 的页码`)}return loadTopics(target)};jump.onclick=()=>go().catch(showError);pageInput.onkeydown=event=>{if(event.key==='Enter')go().catch(showError)};const next=add(pager,'button','下一页','secondary');next.disabled=data.page>=pages;next.onclick=()=>loadTopics(data.page+1).catch(showError)}
     async function showTopic(id){const res=await fetch('/api/topics/'+encodeURIComponent(id));const topic=await res.json();if(!res.ok)throw new Error(topic.detail||'无法读取主题');$('modal-title').textContent=topic.title||'（无标题）';$('modal-meta').textContent=`知识星球发布时间：${bjt(topic.published_at)} · ${topic.author||'未知作者'}`;const body=$('modal-body');body.replaceChildren();tags(body,topic.tags||[]);add(body,'div',topic.content||'（无正文）','preview');const details=document.createElement('div');details.className='details';add(details,'div','已识别股票：'+(topic.stocks.map(x=>`${x.code} ${x.name}`.trim()).join('、')||'无'));add(details,'div','已识别关键词：'+(topic.keywords.map(x=>x.keyword).join('、')||'无'));body.append(details);$('topic-modal').showModal()}
     async function loadStats(){const q=new URLSearchParams();[['stat-keyword','keyword'],['stat-stock','stock_code'],['stat-from','start_date'],['stat-to','end_date']].forEach(([id,key])=>{const value=$(id).value;if(value)q.set(key,value)});const res=await fetch('/api/stats/keywords?'+q);const data=await res.json();const rows=$('stat-rows');rows.replaceChildren();data.forEach(item=>{const row=document.createElement('tr');[item.keyword,item.topic_count,item.stock_count,item.avg_return_20d==null?'-':(item.avg_return_20d*100).toFixed(2)+'%',item.rise_rate_10pct_20d==null?'-':(item.rise_rate_10pct_20d*100).toFixed(2)+'%',`${item.eligible_count_20d} / ${item.sample_sufficient?'充足':'不足10篇'}`].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
+    async function loadManualKeywords(){const res=await fetch('/api/keywords/manual?include_inactive=true');const data=await res.json();if(!res.ok)throw new Error(data.detail||'词库查询失败');const rows=$('manual-rows');rows.replaceChildren();$('manual-status').className='muted';$('manual-status').textContent=`共 ${data.length} 个关键词，停用词仍保留历史关联`;data.forEach(item=>{const row=document.createElement('tr');add(row,'td',item.keyword);add(row,'td',item.active?'启用':'停用');add(row,'td',String(item.topic_count));const actions=document.createElement('td');const edit=add(actions,'button','修改','secondary');edit.onclick=()=>editManualKeyword(item.id,item.keyword).catch(showManualError);const toggle=add(actions,'button',item.active?'停用':'启用','secondary');toggle.onclick=()=>toggleManualKeyword(item.id,!item.active).catch(showManualError);row.append(actions);rows.append(row)})}
+    async function createManualKeyword(){const input=$('manual-keyword');const keyword=input.value.trim();if(!keyword){$('manual-status').textContent='请输入关键词';return}const res=await fetch('/api/keywords/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword})});const data=await res.json();if(!res.ok)throw new Error(data.detail||'新增失败');input.value='';$('manual-status').textContent=`已保存“${data.keyword}”，后续同步主题时生效`;await loadManualKeywords()}
+    async function editManualKeyword(id,current){const keyword=prompt('修改关键词',current);if(keyword===null||!keyword.trim()||keyword.trim()===current)return;const res=await fetch('/api/keywords/manual/'+encodeURIComponent(id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyword})});const data=await res.json();if(!res.ok)throw new Error(data.detail||'修改失败');await loadManualKeywords()}
+    async function toggleManualKeyword(id,active){const res=await fetch('/api/keywords/manual/'+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active})});const data=await res.json();if(!res.ok)throw new Error(data.detail||'状态更新失败');await loadManualKeywords()}
     async function loadAutoKeywords(){const q=new URLSearchParams();const filter=$('auto-filter').value.trim();if(filter)q.set('keyword',filter);const res=await fetch('/api/stats/auto-keywords?'+q);const data=await res.json();if(!res.ok)throw new Error(data.detail||'自动关键词查询失败');const ranked=data.filter(item=>item.sample_sufficient);const rows=$('auto-rows');rows.replaceChildren();$('auto-status').className='muted';$('auto-status').textContent=data.length?`共 ${data.length} 个候选，显示 ${ranked.length} 个样本充足（有效样本≥10）`:'暂无自动关键词，请点击“扫描并更新关键词”';if(!ranked.length)return;ranked.forEach(item=>{const row=document.createElement('tr');const word=document.createElement('button');word.className='secondary';word.textContent=item.keyword;word.onclick=()=>showAutoKeyword(item.keyword_id).catch(showAutoError);const wordCell=document.createElement('td');wordCell.append(word);row.append(wordCell);[item.topic_count,item.eligible_count_20d,item.success_count_20d,item.rise_rate_10pct_20d==null?'-':(item.rise_rate_10pct_20d*100).toFixed(2)+'%',item.avg_return_20d==null?'-':(item.avg_return_20d*100).toFixed(2)+'%',item.uplift_vs_baseline==null?'-':(item.uplift_vs_baseline*100).toFixed(2)+'%',item.dedup_stock_rise_rate_20d==null?'-':(item.dedup_stock_rise_rate_20d*100).toFixed(2)+'%（'+item.dedup_stock_count+'只）',item.representative_stocks.map(x=>`${x.name||x.code}(${x.topics})`).join('、')||'-'].forEach(value=>add(row,'td',String(value)));rows.append(row)})}
     async function discoverAutoKeywords(){const button=$('discover-auto');button.disabled=true;$('auto-status').className='muted';$('auto-status').textContent='正在清理旧结果并扫描荐股强调词，数据量较大时需要一些时间…';try{const res=await fetch('/api/analyze/discover-keywords',{method:'POST'});const data=await res.json();if(!res.ok)throw new Error(data.detail||'强调词扫描失败');$('auto-status').textContent=`扫描 ${data.topics_scanned} 篇主题，发现 ${data.candidate_keywords} 个强调词，建立 ${data.links_added} 条关联`;await loadAutoKeywords()}finally{button.disabled=false}}
     async function showAutoKeyword(id){const res=await fetch('/api/stats/auto-keywords/'+encodeURIComponent(id));const data=await res.json();if(!res.ok)throw new Error(data.detail||'无法读取关键词详情');$('auto-modal-title').textContent=`关键词：${data.keyword}`;$('auto-modal-meta').textContent=`展示最近 ${data.topics.length} 篇相关主题`;$('auto-modal-body').replaceChildren();if(!data.topics.length){add($('auto-modal-body'),'p','没有相关主题。','muted')}data.topics.forEach(topic=>{const block=document.createElement('article');block.className='topic';add(block,'div',topic.title||'（无标题）','topic-title');add(block,'div',`${bjt(topic.published_at)} · ${topic.author||'未知作者'}`,'meta');add(block,'div','出现上下文：'+(topic.context||'—'),'preview');add(block,'div','关联股票：'+(topic.stocks.map(x=>`${x.code} ${x.name}`.trim()).join('、')||'无'),'meta');const returns=topic.returns.map(x=>`${x.code} 20日收益 ${x.return_20d==null?'-':(x.return_20d*100).toFixed(2)+'%'}，最高收盘 ${x.max_return_20d==null?'-':(x.max_return_20d*100).toFixed(2)+'%'}`).join('；');add(block,'div','行情结果：'+(returns||'无完整20日行情'),'meta');$('auto-modal-body').append(block)});$('auto-modal').showModal()}
-    $('load-quote-status').onclick=loadQuoteStatus;$('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}function showAutoError(error){$('auto-status').textContent=error.message;$('auto-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);$('discover-auto').onclick=()=>discoverAutoKeywords().catch(showAutoError);$('load-auto').onclick=()=>loadAutoKeywords().catch(showAutoError);$('auto-filter').onkeydown=event=>{if(event.key==='Enter')loadAutoKeywords().catch(showAutoError)};$('close-auto-modal').onclick=()=>$('auto-modal').close();loadQuoteStatus();loadTopics().catch(showError);loadStats().catch(showError);loadAutoKeywords().catch(showAutoError);
+    async function resumeQuoteSync(){const button=$('resume-quote-sync');button.disabled=true;$('quote-status').className='muted';$('quote-status').textContent='正在启动后台任务…';try{const res=await fetch('/api/quotes/sync-resume',{method:'POST'});const data=await res.json();if(!res.ok)throw new Error(data.detail||'启动失败');$('quote-status').textContent=`后台任务已启动：已完成 ${data.completed} / ${data.total}，待重试 ${data.retrying}`;state.quoteTimer=setTimeout(loadQuoteStatus,2000)}catch(error){$('quote-status').textContent=error.message;$('quote-status').className='error'}finally{button.disabled=false}}
+    $('load-quote-status').onclick=loadQuoteStatus;$('resume-quote-sync').onclick=()=>resumeQuoteSync().catch(showError);$('search-topics').onclick=()=>loadTopics(1).catch(showError);$('clear-topics').onclick=()=>{$('topic-keywords').value='';loadTopics(1).catch(showError)};$('topic-keywords').onkeydown=event=>{if(event.key==='Enter')loadTopics(1).catch(showError)};$('close-modal').onclick=()=>$('topic-modal').close();function showError(error){$('topic-status').textContent=error.message;$('topic-status').className='error'}function showAutoError(error){$('auto-status').textContent=error.message;$('auto-status').className='error'}function showManualError(error){$('manual-status').textContent=error.message;$('manual-status').className='error'}$('load-stats').onclick=()=>loadStats().catch(showError);$('discover-auto').onclick=()=>discoverAutoKeywords().catch(showAutoError);$('load-auto').onclick=()=>loadAutoKeywords().catch(showAutoError);$('auto-filter').onkeydown=event=>{if(event.key==='Enter')loadAutoKeywords().catch(showAutoError)};$('add-manual-keyword').onclick=()=>createManualKeyword().catch(showManualError);$('load-manual-keywords').onclick=()=>loadManualKeywords().catch(showManualError);$('manual-keyword').onkeydown=event=>{if(event.key==='Enter')createManualKeyword().catch(showManualError)};$('close-auto-modal').onclick=()=>$('auto-modal').close();loadQuoteStatus();loadTopics().catch(showError);loadStats().catch(showError);loadManualKeywords().catch(showManualError);loadAutoKeywords().catch(showAutoError);
     </script></body></html>""")
 
 
@@ -266,43 +472,26 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
     codes = request.stock_codes or list(db.scalars(select(Stock.stock_code).join(TopicStock).distinct()))
     imported = skipped = no_data = invalid_rows = 0
     failed_codes: list[str] = []
+    failure_reasons: dict[str, str] = {}
     try:
         for code in codes:
             # A single code/provider response must not abort the whole batch.
             # Missing trading days are naturally omitted by AKShare; available
             # rows are still imported and the next code continues normally.
             try:
-                rows = fetch_akshare_quotes(code, start_date, end_date, request.adjust_type)
+                rows = _fetch_quotes_with_retry(code, start_date, end_date,
+                                                request.adjust_type, request.max_attempts)
             except Exception as exc:
                 failed_codes.append(code)
-                log.warning("quote fetch skipped code=%s (%s)", code, type(exc).__name__)
+                failure_reasons[code] = type(exc).__name__
                 continue
             if not rows:
                 no_data += 1
                 continue
-            stock = db.scalar(select(Stock).where(Stock.stock_code == code))
-            if not stock:
-                stock = Stock(stock_code=code, exchange="SH" if code.startswith("6") else "SZ")
-                db.add(stock)
-                db.flush()
-            for row in rows:
-                try:
-                    trade_date = date.fromisoformat(row["date"])
-                except (KeyError, TypeError, ValueError):
-                    invalid_rows += 1
-                    log.warning("quote row skipped code=%s (invalid date)", code)
-                    continue
-                exists = db.scalar(select(StockDailyQuote).where(StockDailyQuote.stock_id == stock.id,
-                                                                  StockDailyQuote.trade_date == trade_date,
-                                                                  StockDailyQuote.adjust_type == request.adjust_type))
-                if exists:
-                    skipped += 1
-                    continue
-                db.add(StockDailyQuote(stock_id=stock.id, trade_date=trade_date,
-                                       open=row["open"], high=row["high"], low=row["low"], close=row["close"],
-                                       volume=row["volume"], amount=row["amount"],
-                                       turnover_rate=row["turnover_rate"], adjust_type=request.adjust_type))
-                imported += 1
+            counts = _store_quote_rows(db, code, rows, request.adjust_type)
+            imported += counts["imported"]
+            skipped += counts["skipped"]
+            invalid_rows += counts["invalid_rows"]
         db.commit()
     except RuntimeError as exc:
         db.rollback()
@@ -311,7 +500,8 @@ def sync_quotes(request: QuoteSyncIn, db: Session = Depends(db_session)):
         db.rollback()
         raise HTTPException(400, f"invalid market data: {exc}") from exc
     return {"provider": "akshare", "imported": imported, "skipped": skipped, "no_data": no_data,
-            "invalid_rows": invalid_rows, "failed": len(failed_codes), "failed_codes": failed_codes}
+            "invalid_rows": invalid_rows, "failed": len(failed_codes), "failed_codes": failed_codes,
+            "failure_reasons": failure_reasons, "max_attempts": request.max_attempts}
 
 
 @app.get("/api/quotes/sync-status")
@@ -339,13 +529,36 @@ def quote_sync_status(db: Session = Depends(db_session)):
     if checkpoint is None:
         return result
 
-    completed = len(set(checkpoint["completed_codes"]))
+    completed_codes = set(checkpoint["completed_codes"])
+    failed_codes = set(checkpoint.get("last_failed_codes") or []) - completed_codes
+    completed = len(completed_codes)
     total = checkpoint.get("total") or total_stocks
-    failed = len(set(checkpoint.get("last_failed_codes") or []))
+    failed = len(failed_codes)
+    processed = min(completed + failed, total)
     updated_at = checkpoint["updated_at"]
-    if total and completed >= total:
-        status, status_text = "completed", "已完成"
-    elif datetime.now(timezone.utc) - updated_at <= timedelta(minutes=3):
+    stored_status = checkpoint.get("status")
+    fresh = datetime.now(timezone.utc) - updated_at <= timedelta(minutes=3)
+    if stored_status == "analyzing" and fresh:
+        status, status_text = "analyzing", "行情已同步，正在自动重算分析结果"
+    elif stored_status == "analyzing":
+        status, status_text = "paused", "自动重算已中断，可点击后台继续/重试"
+    elif stored_status == "failed":
+        status, status_text = "failed", "后台任务失败，可点击重新同步"
+    elif total and processed >= total and failed:
+        status = "completed_with_failures"
+        status_text = (f"已完成并重算（{failed} 只重试后仍失败）"
+                       if checkpoint.get("analysis_status") == "completed"
+                       else f"行情已完成（{failed} 只失败），点击后台继续/重试后自动重算")
+    elif total and completed >= total:
+        status, status_text = "completed", ("已完成并重算" if checkpoint.get("analysis_status") == "completed"
+                                              else "行情已完成，分析尚未自动重算")
+    elif stored_status == "paused":
+        status, status_text = "paused", "已暂停，可从断点继续"
+    elif stored_status == "running" and fresh:
+        status, status_text = "running", "后台同步中"
+    elif stored_status == "running":
+        status, status_text = "paused", "后台同步已中断，可从断点继续"
+    elif fresh:
         status, status_text = "running", "同步中"
     else:
         status, status_text = "paused", "已暂停，可从断点继续"
@@ -354,15 +567,158 @@ def quote_sync_status(db: Session = Depends(db_session)):
         "status_text": status_text,
         "completed": completed,
         "total": total,
-        "remaining": max(total - completed, 0),
-        "percent": round(completed * 100 / total, 2) if total else 0,
+        "remaining": max(total - processed, 0),
+        "percent": round(processed * 100 / total, 2) if total else 0,
         "failed": failed,
+        "failed_codes": sorted(failed_codes)[:50],
+        "failure_reasons": checkpoint.get("failure_reasons") or {},
         "start_date": checkpoint.get("start_date"),
         "end_date": checkpoint.get("end_date"),
         "updated_at": updated_at,
         "state_file": checkpoint["state_file"],
+        "analysis_status": checkpoint.get("analysis_status"),
+        "analysis_event_returns": checkpoint.get("analysis_event_returns"),
+        "analysis_completed_at": checkpoint.get("analysis_completed_at"),
     }
     return result
+
+
+@app.post("/api/quotes/sync-resume")
+def quote_sync_resume(db: Session = Depends(db_session)):
+    """Continue the newest full-market quote sync from its checkpoint."""
+    checkpoint = latest_quote_checkpoint()
+    if not checkpoint:
+        raise HTTPException(404, "没有找到全量行情断点文件，无法续跑")
+    fresh = datetime.now(timezone.utc) - checkpoint["updated_at"] <= timedelta(minutes=3)
+    if ((checkpoint.get("status") in {"running", "analyzing"} and fresh)
+            or (not checkpoint.get("status") and fresh)):
+        raise HTTPException(409, "同步正在运行中，请稍后再试")
+    if not _quote_sync_lock.acquire(blocking=False):
+        raise HTTPException(409, "同步正在运行中，请稍后再试")
+    threading.Thread(target=_resume_quote_sync_worker,
+                     args=(checkpoint["state_file"],
+                           checkpoint.get("start_date") or f"{date.today().year}-01-01",
+                           checkpoint.get("end_date") or date.today().isoformat()),
+                     daemon=True).start()
+    return {"status": "started", "state_file": checkpoint["state_file"],
+            "completed": len(set(checkpoint["completed_codes"])),
+            "total": checkpoint.get("total") or 0,
+            "retrying": len(set(checkpoint.get("last_failed_codes") or [])
+                            - set(checkpoint["completed_codes"]))}
+
+
+@app.get("/api/stocks/search")
+def search_stocks(keyword: str = "", market: str = "all", limit: int = 20,
+                  db: Session = Depends(db_session)):
+    if market not in MARKETS:
+        raise HTTPException(400, "market must be all, main, gem, star or bse")
+    if limit < 1 or limit > 50:
+        raise HTTPException(400, "limit must be between 1 and 50")
+    statement = select(Stock)
+    clause = market_clause(Stock.stock_code, market)
+    if clause is not None:
+        statement = statement.where(clause)
+    needle = keyword.strip()
+    if needle:
+        pattern = f"%{needle}%"
+        statement = statement.where(or_(Stock.stock_code.ilike(pattern), Stock.stock_name.ilike(pattern)))
+    rows = db.scalars(statement.order_by(Stock.stock_code).limit(limit)).all()
+    return [{"code": stock.stock_code, "name": stock.stock_name,
+             "market": market_for_code(stock.stock_code)} for stock in rows]
+
+
+@app.get("/api/stocks/market-list")
+def stock_market_list(keyword: str = "", market: str = "all", period: str = "1d",
+                      page: int = 1, page_size: int = 100, sort: str = "desc",
+                      adjust_type: str = "qfq", db: Session = Depends(db_session)):
+    if market not in MARKETS:
+        raise HTTPException(400, "market must be all, main, gem, star or bse")
+    if period not in PERIODS:
+        raise HTTPException(400, "unsupported period")
+    if page < 1 or page_size not in {100, 200, 500}:
+        raise HTTPException(400, "page must be >= 1 and page_size must be 100, 200 or 500")
+    if sort not in {"asc", "desc"}:
+        raise HTTPException(400, "sort must be asc or desc")
+    if adjust_type not in {"qfq", "hfq", "none"}:
+        raise HTTPException(400, "adjust_type must be qfq, hfq or none")
+
+    statement = select(Stock)
+    clause = market_clause(Stock.stock_code, market)
+    if clause is not None:
+        statement = statement.where(clause)
+    needle = keyword.strip()
+    if needle:
+        pattern = f"%{needle}%"
+        statement = statement.where(or_(Stock.stock_code.ilike(pattern), Stock.stock_name.ilike(pattern)))
+    stocks = db.scalars(statement.order_by(Stock.stock_code)).all()
+    total = len(stocks)
+    if not stocks:
+        return {"items": [], "total": 0, "page": page, "page_size": page_size,
+                "period": period, "sort": sort}
+
+    stock_ids = [stock.id for stock in stocks]
+    ranked = select(
+        StockDailyQuote.stock_id, StockDailyQuote.trade_date, StockDailyQuote.open,
+        StockDailyQuote.high, StockDailyQuote.low, StockDailyQuote.close,
+        StockDailyQuote.volume, StockDailyQuote.turnover_rate,
+        func.row_number().over(
+            partition_by=StockDailyQuote.stock_id,
+            order_by=StockDailyQuote.trade_date.desc(),
+        ).label("rn"),
+    ).where(StockDailyQuote.stock_id.in_(stock_ids),
+            StockDailyQuote.adjust_type == adjust_type).subquery()
+    base_rank = (int(period[:-1]) + 1) if period[:-1].isdigit() else 1
+    ranked_rows = db.execute(select(ranked).where(ranked.c.rn.in_({1, base_rank}))).all()
+    quote_by_stock: dict[int, dict[int, object]] = {}
+    for row in ranked_rows:
+        quote_by_stock.setdefault(row.stock_id, {})[row.rn] = row
+
+    baseline_by_stock: dict[int, object] = {}
+    if period in {"mtd", "ytd"}:
+        latest_date = db.scalar(select(func.max(StockDailyQuote.trade_date)).where(
+            StockDailyQuote.stock_id.in_(stock_ids), StockDailyQuote.adjust_type == adjust_type))
+        if latest_date:
+            start_date = latest_date.replace(day=1) if period == "mtd" else latest_date.replace(month=1, day=1)
+            baseline = select(StockDailyQuote.stock_id,
+                              func.min(StockDailyQuote.trade_date).label("base_date")).where(
+                StockDailyQuote.stock_id.in_(stock_ids), StockDailyQuote.adjust_type == adjust_type,
+                StockDailyQuote.trade_date >= start_date,
+                StockDailyQuote.trade_date <= latest_date,
+            ).group_by(StockDailyQuote.stock_id).subquery()
+            baseline_rows = db.execute(
+                select(StockDailyQuote.stock_id, StockDailyQuote.close)
+                .join(baseline, (baseline.c.stock_id == StockDailyQuote.stock_id)
+                      & (baseline.c.base_date == StockDailyQuote.trade_date))
+                .where(StockDailyQuote.adjust_type == adjust_type)
+            ).all()
+            baseline_by_stock = {row.stock_id: row.close for row in baseline_rows}
+
+    items = []
+    for stock in stocks:
+        quotes = quote_by_stock.get(stock.id, {})
+        latest = quotes.get(1)
+        if not latest:
+            change = None
+            current = volume = turnover = latest_date = None
+        else:
+            base = baseline_by_stock.get(stock.id) if period in {"mtd", "ytd"} else quotes.get(base_rank)
+            base_close = base.close if hasattr(base, "close") else base
+            change = float((latest.close / base_close - 1) * 100) if base_close else None
+            current, volume, turnover, latest_date = (float(latest.close), float(latest.volume or 0),
+                                                       float(latest.turnover_rate or 0), latest.trade_date)
+        items.append({"code": stock.stock_code, "name": stock.stock_name,
+                      "market": market_for_code(stock.stock_code),
+                      "latest_date": latest_date, "current_price": current,
+                      "change_pct": change, "volume": volume, "turnover_rate": turnover})
+    if sort == "desc":
+        items.sort(key=lambda item: (item["change_pct"] is None,
+                                     -(item["change_pct"] or 0)))
+    else:
+        items.sort(key=lambda item: (item["change_pct"] is None,
+                                     item["change_pct"] if item["change_pct"] is not None else 0))
+    offset = (page - 1) * page_size
+    return {"items": items[offset:offset + page_size], "total": total,
+            "page": page, "page_size": page_size, "period": period, "sort": sort}
 
 
 @app.get("/api/quotes/history/{stock_code}")
@@ -426,9 +782,15 @@ def mentioned_stock_codes(db: Session = Depends(db_session)):
 
 @app.post("/api/analyze/rebuild")
 def analyze(db: Session = Depends(db_session)):
-    rebuild_returns(db)
-    db.commit()
-    return {"status": "ok"}
+    try:
+        rebuild_returns(db)
+        event_returns = db.scalar(select(func.count()).select_from(StockEventReturn)) or 0
+        db.commit()
+        return {"status": "ok", "event_returns": event_returns}
+    except Exception as exc:
+        db.rollback()
+        log.exception("收益重算失败")
+        raise HTTPException(500, "收益重算失败，请查看应用日志") from exc
 
 
 @app.post("/api/analyze/discover-keywords")
@@ -444,6 +806,69 @@ def discover_keywords_api(db: Session = Depends(db_session)):
         db.rollback()
         log.exception("荐股强调词扫描失败")
         raise HTTPException(500, "自动关键词发现失败，请查看应用日志") from exc
+
+
+@app.get("/api/keywords/manual")
+def list_manual_keywords(include_inactive: bool = True, db: Session = Depends(db_session)):
+    ensure_manual_keywords(db)
+    statement = select(Keyword).where(Keyword.category != AUTO_KEYWORD_CATEGORY)
+    if not include_inactive:
+        statement = statement.where(Keyword.active.is_(True))
+    keywords = list(db.scalars(statement.order_by(Keyword.active.desc(), Keyword.keyword)))
+    counts = dict(db.execute(
+        select(TopicKeyword.keyword_id, func.count(func.distinct(TopicKeyword.topic_id)))
+        .group_by(TopicKeyword.keyword_id)
+    ).all())
+    return [manual_keyword_item(keyword, counts) for keyword in keywords]
+
+
+@app.post("/api/keywords/manual")
+def create_manual_keyword(request: ManualKeywordIn, db: Session = Depends(db_session)):
+    term = normalize_manual_keyword(request.keyword)
+    keyword = db.scalar(select(Keyword).where(Keyword.normalized_keyword == term))
+    if keyword:
+        if keyword.category == AUTO_KEYWORD_CATEGORY:
+            raise HTTPException(409, "该词已存在于自动强调词库，不能重复创建")
+        keyword.keyword = term
+        keyword.category = MANUAL_KEYWORD_CATEGORY
+        keyword.active = True
+        db.commit()
+        return manual_keyword_item(keyword, {})
+    keyword = Keyword(keyword=term, normalized_keyword=term,
+                      category=MANUAL_KEYWORD_CATEGORY, active=True)
+    db.add(keyword)
+    db.commit()
+    db.refresh(keyword)
+    return manual_keyword_item(keyword, {})
+
+
+@app.put("/api/keywords/manual/{keyword_id}")
+def update_manual_keyword(keyword_id: int, request: ManualKeywordIn, db: Session = Depends(db_session)):
+    keyword = db.get(Keyword, keyword_id)
+    if not keyword or keyword.category == AUTO_KEYWORD_CATEGORY:
+        raise HTTPException(404, "manual keyword not found")
+    term = normalize_manual_keyword(request.keyword)
+    conflict = db.scalar(select(Keyword).where(
+        Keyword.normalized_keyword == term, Keyword.id != keyword_id))
+    if conflict:
+        raise HTTPException(409, "该关键词已经存在")
+    keyword.keyword = term
+    keyword.normalized_keyword = term
+    keyword.category = MANUAL_KEYWORD_CATEGORY
+    db.commit()
+    return manual_keyword_item(keyword, {})
+
+
+@app.patch("/api/keywords/manual/{keyword_id}")
+def set_manual_keyword_active(keyword_id: int, request: ManualKeywordActiveIn,
+                              db: Session = Depends(db_session)):
+    keyword = db.get(Keyword, keyword_id)
+    if not keyword or keyword.category == AUTO_KEYWORD_CATEGORY:
+        raise HTTPException(404, "manual keyword not found")
+    keyword.active = request.active
+    keyword.category = MANUAL_KEYWORD_CATEGORY
+    db.commit()
+    return manual_keyword_item(keyword, {})
 
 
 @app.get("/api/stats/keywords", response_model=list[KeywordStat])
@@ -562,9 +987,13 @@ def update_annotations(topic_id: str, request: TopicAnnotationsIn, db: Session =
     for raw in keywords:
         keyword = db.scalar(select(Keyword).where(Keyword.normalized_keyword == raw))
         if not keyword:
-            keyword = Keyword(keyword=raw, normalized_keyword=raw)
+            keyword = Keyword(keyword=raw, normalized_keyword=raw,
+                              category=MANUAL_KEYWORD_CATEGORY, active=True)
             db.add(keyword)
             db.flush()
+        elif keyword.category != AUTO_KEYWORD_CATEGORY:
+            keyword.category = MANUAL_KEYWORD_CATEGORY
+            keyword.active = True
         db.add(TopicKeyword(topic_id=topic.id, keyword_id=keyword.id, context="人工标注"))
     db.commit()
     return {"topic_id": topic_id, "stocks": len(request.stocks), "keywords": len(keywords)}

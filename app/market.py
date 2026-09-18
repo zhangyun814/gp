@@ -46,7 +46,8 @@ def fetch_akshare_quotes(stock_code: str, start_date: date, end_date: date, adju
         pass
 
     # ponytail: keep one small fallback for proxies that break Eastmoney's K-line endpoint.
-    symbol = ("sh" if stock_code.startswith("6") else "sz") + stock_code
+    # Sina routes Beijing Stock Exchange 920xxx symbols through the bj prefix.
+    symbol = ("bj" if stock_code.startswith("920") else "sh" if stock_code.startswith("6") else "sz") + stock_code
     try:
         frame = ak.stock_zh_a_daily(symbol=symbol, start_date=start_date.strftime("%Y%m%d"),
                                     end_date=end_date.strftime("%Y%m%d"), adjust=adjust)

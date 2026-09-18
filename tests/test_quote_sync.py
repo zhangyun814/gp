@@ -1,6 +1,9 @@
+import io
 import unittest
+from urllib.error import URLError
+from unittest.mock import patch
 
-from scripts.sync_quotes import next_batch, state_for_run
+from scripts.sync_quotes import next_batch, read_json, state_for_run
 
 
 class QuoteSyncTest(unittest.TestCase):
@@ -16,6 +19,15 @@ class QuoteSyncTest(unittest.TestCase):
                  "end_date": "2026-09-16", "all_stocks": False}
         self.assertEqual(state_for_run(state, "2026-01-01", "2026-09-17", True),
                          {"completed_codes": []})
+
+    @patch("scripts.sync_quotes.time.sleep")
+    @patch("scripts.sync_quotes.urlopen")
+    def test_http_request_retries_transient_failure(self, urlopen, sleep):
+        urlopen.side_effect = [URLError("temporary"), io.BytesIO(b'{"ok": true}')]
+
+        self.assertEqual(read_json("http://127.0.0.1/test"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
 
 
 if __name__ == "__main__":

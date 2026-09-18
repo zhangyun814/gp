@@ -15,3 +15,7 @@ def test_rise_threshold_math():
 
 def test_keyword_normalization_does_not_duplicate_topic_links():
     assert keyword_matches("产品涨价", set()) == {"涨价": "涨价"}
+
+
+def test_keyword_matching_accepts_editable_dictionary():
+    assert keyword_matches("重点推荐深信服", set(), {"重点推荐": "重点推荐"}) == {"重点推荐": "重点推荐"}

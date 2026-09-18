@@ -1,9 +1,11 @@
 import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
-from app.main import latest_quote_checkpoint
+from app.main import _fetch_quotes_with_retry, latest_quote_checkpoint
 
 
 class QuoteStatusTest(unittest.TestCase):
@@ -27,6 +29,17 @@ class QuoteStatusTest(unittest.TestCase):
             (data_dir / "quote-sync-all-broken.json").write_text("not-json", encoding="utf-8")
 
             self.assertIsNone(latest_quote_checkpoint(data_dir))
+
+    @patch("app.main.time.sleep")
+    @patch("app.main.fetch_akshare_quotes")
+    def test_single_stock_is_retried_before_failure(self, fetch, sleep):
+        fetch.side_effect = [RuntimeError("temporary"), [{"date": "2026-09-18"}]]
+
+        rows = _fetch_quotes_with_retry("600519", date(2026, 9, 18), date(2026, 9, 18), "qfq")
+
+        self.assertEqual(rows, [{"date": "2026-09-18"}])
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(1)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ docker compose up --build
 
 打开 http://localhost:8000/docs；K 线查询页面为 http://localhost:8000/kline。
 
-`/kline` 使用 TradingView `lightweight-charts` 绘制日线蜡烛图，读取 PostgreSQL 的 `stock_daily_quote`。输入已经同步行情的 A 股代码（例如 `600519`）即可查询；页面支持前复权、后复权、不复权和成交量展示。
+`/kline` 使用 TradingView `lightweight-charts` 绘制 K 线，读取 PostgreSQL 的 `stock_daily_quote`。页面支持按代码/名称搜索、主板/创业板/科创板/北交所筛选、100/200/500 条分页、按当前周期涨幅排序，以及日线、3/5/10/20/60 日、月初至今和年初至今周期。点击股票列表可打开对应 K 线；复权方式支持前复权、后复权和不复权，成交量与 K 线对齐展示。
 
 ## 知识星球直连同步
 
@@ -88,6 +88,34 @@ sh scripts/uninstall_zsxq_launchd.sh
 
 Mac 需要保持开机并登录用户会话；Docker 的 `app` 和 `postgres` 也需要保持运行。
 
+### 项目级每日行情增量同步（Mac launchd）
+
+行情任务与主题任务分开运行。它在工作日每天 16:00（A 股收盘后）同步当天全部上市股票；周末自动跳过。每个日期使用独立断点文件，单只股票或本地 HTTP 请求失败默认自动尝试 3 次，网络中断后再次运行会跳过已完成股票并继续失败股票。全部股票处理完成后自动重算主题事件收益和关键词统计。任务不在晚上运行。
+
+安装或更新任务：
+
+```bash
+cd /Users/zhangyun/Documents/code/planet-stock-analyzer
+sh scripts/install_quotes_launchd.sh
+```
+
+查看任务和日志：
+
+```bash
+launchctl print gui/$(id -u)/com.zhangyun.planet-stock-analyzer.quotes-sync
+tail -f ~/Library/Logs/planet-stock-analyzer/quotes-sync.log
+```
+
+停止任务（不会删除历史断点）：
+
+```bash
+sh scripts/uninstall_quotes_launchd.sh
+```
+
+Docker 的 `app` 和 `postgres` 需要保持运行；数据和重算结果都写入 PostgreSQL。
+
+首页“行情同步进度”中的“后台继续/重试”可以从最新断点启动容器内后台任务。页面会每 5 秒刷新进度；失败股票自动尝试 3 次，整批处理结束后状态会先变为“正在自动重算分析”，再变为“已完成”。即使仍有个别行情源不提供数据的股票，已有行情也会参与重算，失败代码会保留在断点中供下次继续重试。
+
 ## 一个月涨幅关键词统计
 
 “未来 1 月”按主题事件日后的 20 个交易日计算：期间最高收盘价相对事件日收盘价涨幅达到 10% 即标记为成功。只有完整取得 20 个交易日行情的主题会进入该排行；它是历史相关性统计，不是投资建议。
@@ -105,6 +133,8 @@ curl -X POST http://localhost:8000/api/analyze/rebuild
 ```
 
 刷新首页的“关键词统计”，即可按“未来 1 月涨幅≥10%比例”查看排行。
+
+首页的“人工关键词词库”支持新增、修改、启用和停用关键词。词库保存在 PostgreSQL 中，不再需要修改 Python 代码；停用只影响后续主题识别，历史关联和原文仍保留。
 
 ### 荐股强调词分析
 

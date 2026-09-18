@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zhangyun.planet-stock-analyzer.quotes-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/Users/zhangyun/Library/Application Support/planet-stock-analyzer-quotes/run_quotes_sync.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/quotes-launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/quotes-launchd.stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>QUOTE_LOG_DIR</key>
+        <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer</string>
+        <key>QUOTE_LOG_FILE</key>
+        <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/quotes-sync.log</string>
+        <key>QUOTE_STATE_DIR</key>
+        <string>/Users/zhangyun/Library/Application Support/planet-stock-analyzer-quotes/state</string>
+        <key>QUOTE_LOCK_DIR</key>
+        <string>/Users/zhangyun/Library/Logs/planet-stock-analyzer/.quotes-sync.lock</string>
+        <key>PLANET_APP_URL</key>
+        <string>http://127.0.0.1:8000</string>
+    </dict>
+</dict>
+</plist>

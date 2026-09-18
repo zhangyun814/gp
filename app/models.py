@@ -58,6 +58,7 @@ class Keyword(Base):
     keyword: Mapped[str] = mapped_column(String(100))
     normalized_keyword: Mapped[str] = mapped_column(String(100), unique=True)
     category: Mapped[str] = mapped_column(String(50), default="general")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
 class TopicKeyword(Base):

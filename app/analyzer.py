@@ -23,6 +23,7 @@ KEYWORDS = {
     "出口": "出口", "需求": "需求", "库存": "库存", "盈利": "盈利", "景气度": "景气度",
     "供给收缩": "供给收缩",
 }
+MANUAL_KEYWORD_CATEGORY = "manual"
 
 # Editable seed aliases; a licensed stock master can replace this map later.
 STOCK_ALIASES = {
@@ -70,12 +71,29 @@ def context(text: str, term: str, width: int = 80) -> str:
     return text[max(0, pos - width // 2):pos + len(term) + width // 2] if pos >= 0 else text[:width]
 
 
-def keyword_matches(text: str, tokens: set[str]) -> dict[str, str]:
+def keyword_matches(text: str, tokens: set[str], keyword_map: dict[str, str] | None = None) -> dict[str, str]:
     matches: dict[str, str] = {}
-    for raw, normalized in KEYWORDS.items():
+    for raw, normalized in (KEYWORDS if keyword_map is None else keyword_map).items():
         if raw in text or raw in tokens:
             matches.setdefault(normalized, raw)
     return matches
+
+
+def ensure_manual_keywords(db: Session) -> int:
+    """Seed the editable dictionary once, preserving user changes and status."""
+    added = changed = 0
+    for normalized in dict.fromkeys(KEYWORDS.values()):
+        keyword = db.scalar(select(Keyword).where(Keyword.normalized_keyword == normalized))
+        if keyword is None:
+            db.add(Keyword(keyword=normalized, normalized_keyword=normalized,
+                           category=MANUAL_KEYWORD_CATEGORY, active=True))
+            added += 1
+        elif keyword.category != AUTO_KEYWORD_CATEGORY and keyword.category == "general":
+            keyword.category = MANUAL_KEYWORD_CATEGORY
+            changed += 1
+    if added or changed:
+        db.commit()
+    return added
 
 
 def candidate_keywords(text: str, _stock_names: set[str] | None = None) -> set[str]:
@@ -202,10 +220,13 @@ def extract_topic(db: Session, topic: PlanetTopic, stock_catalog: list[Stock] | 
         if not db.scalar(select(TopicStock).where(TopicStock.topic_id == topic.id, TopicStock.stock_id == stock.id)):
             db.add(TopicStock(topic_id=topic.id, stock_id=stock.id,
                               mention_context=context(text, term), confidence=Decimal(str(confidence))))
-    for normalized, raw in keyword_matches(text, tokens).items():
+    manual_keywords = {keyword.keyword: keyword.normalized_keyword for keyword in db.scalars(
+        select(Keyword).where(Keyword.category != AUTO_KEYWORD_CATEGORY, Keyword.active.is_(True)))}
+    for normalized, raw in keyword_matches(text, tokens, manual_keywords).items():
         keyword = db.scalar(select(Keyword).where(Keyword.normalized_keyword == normalized))
         if not keyword:
-            keyword = Keyword(keyword=normalized, normalized_keyword=normalized)
+            keyword = Keyword(keyword=normalized, normalized_keyword=normalized,
+                              category=MANUAL_KEYWORD_CATEGORY, active=True)
             db.add(keyword)
             db.flush()
         if not db.scalar(select(TopicKeyword).where(TopicKeyword.topic_id == topic.id, TopicKeyword.keyword_id == keyword.id)):
@@ -301,7 +322,9 @@ def rebuild_returns(db: Session):
 def keyword_stats(db: Session, keyword_filter: str | None = None, stock_code: str | None = None,
                   start_date: date | None = None, end_date: date | None = None):
     result = []
-    keywords = list(db.scalars(select(Keyword).order_by(Keyword.normalized_keyword)))
+    keywords = list(db.scalars(select(Keyword).where(
+        Keyword.category != AUTO_KEYWORD_CATEGORY, Keyword.active.is_(True)
+    ).order_by(Keyword.normalized_keyword)))
     if keyword_filter:
         needle = keyword_filter.lower()
         keywords = [keyword for keyword in keywords if needle in keyword.keyword.lower() or needle in keyword.normalized_keyword.lower()]

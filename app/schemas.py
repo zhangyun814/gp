@@ -46,6 +46,7 @@ class QuoteSyncIn(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     adjust_type: str = "qfq"
+    max_attempts: int = Field(default=3, ge=1, le=5)
 
 
 class StockAnnotationIn(BaseModel):
@@ -58,3 +59,11 @@ class StockAnnotationIn(BaseModel):
 class TopicAnnotationsIn(BaseModel):
     stocks: list[StockAnnotationIn] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
+
+
+class ManualKeywordIn(BaseModel):
+    keyword: str = Field(min_length=1, max_length=100)
+
+
+class ManualKeywordActiveIn(BaseModel):
+    active: bool
