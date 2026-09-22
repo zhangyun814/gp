@@ -80,7 +80,8 @@ def keyword_matches(text: str, tokens: set[str], keyword_map: dict[str, str] | N
 
 
 def ensure_manual_keywords(db: Session) -> int:
-    """Seed the editable dictionary once, preserving user changes and status."""
+    """Seed the editable dictionary once, preserving user changes and status.
+    Words the user deleted are tombstoned (deleted=True) and not re-created."""
     added = changed = 0
     for normalized in dict.fromkeys(KEYWORDS.values()):
         keyword = db.scalar(select(Keyword).where(Keyword.normalized_keyword == normalized))
@@ -88,6 +89,8 @@ def ensure_manual_keywords(db: Session) -> int:
             db.add(Keyword(keyword=normalized, normalized_keyword=normalized,
                            category=MANUAL_KEYWORD_CATEGORY, active=True))
             added += 1
+        elif keyword.deleted:
+            continue
         elif keyword.category != AUTO_KEYWORD_CATEGORY and keyword.category == "general":
             keyword.category = MANUAL_KEYWORD_CATEGORY
             changed += 1

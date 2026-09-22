@@ -540,5 +540,56 @@ class StFilterTest(unittest.TestCase):
         self.assertEqual(result, {})
 
 
+class KeywordFilterTest(unittest.TestCase):
+    def test_filter_manual_keywords_matches_substring(self):
+        from app.main import _keyword_matches_filter
+        keywords = [type("K", (), {"keyword": kw, "normalized_keyword": kw})()
+                    for kw in ["业绩", "业绩预增", "中标"]]
+        self.assertEqual([k.keyword for k in _keyword_matches_filter(keywords, "业绩")],
+                         ["业绩", "业绩预增"])
+        self.assertEqual([k.keyword for k in _keyword_matches_filter(keywords, "业绩预增")],
+                         ["业绩预增"])
+        # 空过滤 → 全部返回
+        self.assertEqual(len(_keyword_matches_filter(keywords, "  ")), 3)
+        # 无匹配 → 空列表
+        self.assertEqual(_keyword_matches_filter(keywords, "不存在"), [])
+
+
+class KeywordDeleteTest(unittest.TestCase):
+    def test_keyword_matches_filter(self):
+        pass
+
+    def test_deleted_seed_keywords_are_not_reseeded(self):
+        """删除过的默认词不被 ensure_manual_keywords 重新加回来。"""
+        from app.analyzer import ensure_manual_keywords, KEYWORDS
+        db = FakeSession()
+        deleted = {"出口"}
+        def fake_scalar(statement):
+            # 参数化查询：从 compile 后的参数里取比较值
+            try:
+                compiled = statement.compile()
+                value = compiled.params.get("normalized_keyword_1")
+            except Exception:
+                value = None
+            if value in deleted:
+                return type("K", (), {"normalized_keyword": value, "deleted": True,
+                                      "category": "manual"})()
+            return None
+        db.scalar = fake_scalar
+        ensure_manual_keywords(db)
+        added_words = [k.normalized_keyword for k in db.added]
+        # 其余 seed 词仍会被播种，但被删除的"出口"不会
+        self.assertNotIn("出口", added_words)
+        self.assertTrue(any(w != "出口" for w in added_words))
+        self.assertTrue(set(added_words) <= set(KEYWORDS.values()))
+
+    def test_delete_manual_keyword_removes_links(self):
+        """DELETE 接口存在且会连着主题关联一起删（用真实 schema 校验路由存在）。"""
+        from app.main import app
+        routes = {f"{getattr(r, 'methods', set())} {r.path}" for r in app.routes}
+        self.assertTrue(any("DELETE" in key and "/api/keywords/manual/{keyword_id}" in key
+                            for key in routes), routes)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,8 +39,19 @@ def _rolling_sum(values: list[float], period: int) -> list[float]:
     return result
 
 
-def calculate_zzr(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Calculate the original close-confirmed 紫紫红 strategy without future data."""
+def calculate_zzr(rows: list[dict[str, Any]],
+                  volume_ratio_max: float = 4.0,
+                  deviation_max: float = 1.18,
+                  require_same_day_breakout: bool = False,
+                  ) -> list[dict[str, Any]]:
+    """Calculate the original close-confirmed 紫紫红 strategy without future data.
+
+    Tunable filters (defaults reproduce the original behaviour):
+    - volume_ratio_max: upper bound of the 5-day volume ratio on breakout.
+    - deviation_max: upper bound of close / EMA20 on breakout.
+    - require_same_day_breakout: only accept signals on the breakout day itself
+      instead of within the following 2 days.
+    """
     if not rows:
         return []
     opens = [float(row["open"]) for row in rows]
@@ -87,12 +98,16 @@ def calculate_zzr(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                      mom[i] > mom_signal[i] and mom_signal[i] > mom_signal[i - 1])
         previous_high = high20[i - 1] if i else highs[i]
         breakout_raw.append(i > 0 and closes[i] > previous_high and closes[i] > opens[i] and
-                            ratio > 1.5 and ratio < 4 and e5[i] > e10[i] > e20[i] > e60[i] and
-                            bool(e20[i]) and closes[i] / e20[i] < 1.18)
+                            ratio > 1.5 and ratio < volume_ratio_max and
+                            e5[i] > e10[i] > e20[i] > e60[i] and
+                            closes[i] / e20[i] < deviation_max)
         momentum_red.append(i > 0 and cmf[i] > 0.05 and cmf[i] > cmf[i - 1] and
                             closes[i] > e20[i] and e20[i] > e20[i - 1])
 
-    breakout = [any(breakout_raw[max(0, i - 2):i + 1]) for i in range(len(rows))]
+    if require_same_day_breakout:
+        breakout = list(breakout_raw)
+    else:
+        breakout = [any(breakout_raw[max(0, i - 2):i + 1]) for i in range(len(rows))]
     active = [(i + 1) > 130 and trend[i] and breakout[i] and momentum_red[i]
               for i in range(len(rows))]
     signal = [value and (i == 0 or not active[i - 1]) for i, value in enumerate(active)]
