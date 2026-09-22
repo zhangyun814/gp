@@ -91,8 +91,9 @@ class ZsxqParserTest(unittest.TestCase):
         )
         self.assertEqual(fetch_page("zsxq-cli", "123", 20, "2026-09-16T10:00:00+0800")["ok"], True)
         run.assert_called_once_with(
-            ["zsxq-cli", "group", "+topics", "--group-id", "123", "--limit", "20", "--json",
-             "--end-time", "2026-09-16T10:00:00+0800"],
+            ["zsxq-cli", "api", "call", "get_group_topics", "--params",
+             json.dumps({"group_id": "123", "limit": 20, "scope": "digests",
+                         "end_time": "2026-09-16T10:00:00+0800"})],
             capture_output=True, text=True, check=False,
         )
 

@@ -42,14 +42,28 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
 SYNC_DATE=$(date '+%Y-%m-%d')
 STATE_FILE="$STATE_DIR/quote-sync-all-$SYNC_DATE.json"
 printf '[%s] start date=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$SYNC_DATE" >> "$LOG_FILE"
-/usr/bin/python3 "$SYNC_SCRIPT" \
-  --app-url "$APP_URL" \
-  --all-stocks \
-  --start-date "$SYNC_DATE" \
-  --end-date "$SYNC_DATE" \
-  --batch-size "$BATCH_SIZE" \
-  --batches "$BATCHES" \
-  --state-file "$STATE_FILE" >> "$LOG_FILE" 2>&1
-status=$?
+RUN_ATTEMPTS="${QUOTE_RUN_ATTEMPTS:-3}"
+RETRY_DELAY="${QUOTE_RETRY_DELAY:-60}"
+attempt=1
+status=1
+while [ "$attempt" -le "$RUN_ATTEMPTS" ]; do
+  /usr/bin/python3 "$SYNC_SCRIPT" \
+    --app-url "$APP_URL" \
+    --all-stocks \
+    --start-date "$SYNC_DATE" \
+    --end-date "$SYNC_DATE" \
+    --batch-size "$BATCH_SIZE" \
+    --batches "$BATCHES" \
+    --fail-on-incomplete \
+    --state-file "$STATE_FILE" >> "$LOG_FILE" 2>&1
+  status=$?
+  [ "$status" -eq 0 ] && break
+  if [ "$attempt" -lt "$RUN_ATTEMPTS" ]; then
+    printf '[%s] failed attempt=%s/%s; retrying in %ss\n' \
+      "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$attempt" "$RUN_ATTEMPTS" "$RETRY_DELAY" >> "$LOG_FILE"
+    sleep "$RETRY_DELAY"
+  fi
+  attempt=$((attempt + 1))
+done
 printf '[%s] exit=%s date=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$status" "$SYNC_DATE" >> "$LOG_FILE"
 exit "$status"

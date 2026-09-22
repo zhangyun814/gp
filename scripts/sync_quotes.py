@@ -30,7 +30,7 @@ def read_json(url: str, payload: dict | None = None, max_attempts: int = 3) -> o
         except HTTPError as exc:
             if exc.code < 500 or attempt == max_attempts:
                 raise
-        except (URLError, TimeoutError):
+        except (URLError, ConnectionError, TimeoutError):
             if attempt == max_attempts:
                 raise
         time.sleep(2 ** (attempt - 1))
@@ -56,6 +56,12 @@ def next_batch(codes: list[str], completed: set[str], size: int,
     return [code for code in codes if code not in completed and code not in excluded][:size]
 
 
+def classify_batch(batch: list[str], result: dict) -> tuple[set[str], set[str], set[str]]:
+    failed = set(result.get("failed_codes") or [])
+    no_data = set(result.get("no_data_codes") or [])
+    return set(batch) - failed - no_data, failed, no_data
+
+
 def state_for_run(state: dict, start_date: str, end_date: str, all_stocks: bool) -> dict:
     expected = (start_date, end_date, all_stocks)
     actual = (state.get("start_date"), state.get("end_date"), state.get("all_stocks"))
@@ -72,6 +78,8 @@ def main() -> int:
     parser.add_argument("--max-attempts", type=int, default=3, help="单只股票或 HTTP 失败的最多尝试次数")
     parser.add_argument("--state-file", default="data/quote-sync-state.json")
     parser.add_argument("--all-stocks", action="store_true", help="同步当前全部上市 A 股，而不只同步主题提及股票")
+    parser.add_argument("--fail-on-incomplete", action="store_true",
+                        help="有未完成股票时返回失败状态，供定时任务重试")
     args = parser.parse_args()
     if args.batch_size < 1 or args.batches < 1 or not 1 <= args.max_attempts <= 5:
         parser.error("--batch-size、--batches 必须大于 0，--max-attempts 必须在 1 到 5 之间")
@@ -114,8 +122,7 @@ def main() -> int:
         skipped += result["skipped"]
         no_data += result.get("no_data", 0)
         invalid_rows += result.get("invalid_rows", 0)
-        batch_failed = set(result.get("failed_codes", []))
-        succeeded = set(batch) - batch_failed
+        succeeded, batch_failed, _ = classify_batch(batch, result)
         failed_codes.difference_update(succeeded)
         failed_codes.update(batch_failed)
         completed.update(succeeded)
@@ -159,7 +166,7 @@ def main() -> int:
                       "failed_codes": sorted(failed_codes),
                       "status": state["status"], "analysis_status": state["analysis_status"],
                       "state_file": str(state_path)}, ensure_ascii=False))
-    return 0
+    return 2 if args.fail_on_incomplete and state["status"] == "paused" else 0
 
 
 if __name__ == "__main__":

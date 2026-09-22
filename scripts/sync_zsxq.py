@@ -59,15 +59,15 @@ def _cli_error(payload: dict) -> RuntimeError:
 
 
 def fetch_page(cli: str, group_id: str, count: int, end_time: str | None) -> dict:
-    """Read one page via the CLI's supported group-topics command.
+    """Read one digests-only page via the CLI's MCP get_group_topics.
 
-    Do not use ``api raw /v2/groups/<id>/topics`` here.  That browser endpoint
-    is not registered by the official CLI's raw-API bridge.  ``group +topics``
-    is the supported read-only command and explicitly supports ``--end-time``.
+    ``scope=digests`` returns only digested (精华) topics with a working
+    pagination cursor, which the plain ``group +topics`` command cannot do.
     """
-    command = [cli, "group", "+topics", "--group-id", group_id, "--limit", str(count), "--json"]
+    params: dict = {"group_id": group_id, "limit": count, "scope": "digests"}
     if end_time:
-        command.extend(["--end-time", end_time])
+        params["end_time"] = end_time
+    command = [cli, "api", "call", "get_group_topics", "--params", json.dumps(params)]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
     except OSError as exc:

@@ -30,7 +30,7 @@ class QuoteStatusTest(unittest.TestCase):
 
             self.assertIsNone(latest_quote_checkpoint(data_dir))
 
-    @patch("app.main.time.sleep")
+    @patch("app.main._time_module.sleep")
     @patch("app.main.fetch_akshare_quotes")
     def test_single_stock_is_retried_before_failure(self, fetch, sleep):
         fetch.side_effect = [RuntimeError("temporary"), [{"date": "2026-09-18"}]]

@@ -191,14 +191,20 @@ def discover_auto_keywords(db: Session, min_topics: int = AUTO_KEYWORD_MIN_TOPIC
             "max_terms_per_topic": AUTO_KEYWORD_MAX_PER_TOPIC}
 
 
-def _stock_record(db: Session, code: str, name: str = "") -> Stock:
+def _stock_record(db: Session, code: str, name: str = "", known_codes: set[str] | None = None) -> Stock | None:
+    """Return (or create) the Stock for a matched code. Bare code matches with no
+    name are only trusted when the code exists in the A-share master (known_codes);
+    otherwise they are foreign/invalid codes (e.g. Korean tickers) and skipped."""
     stock = db.scalar(select(Stock).where(Stock.stock_code == code))
-    if not stock:
-        stock = Stock(stock_code=code, stock_name=name, exchange=exchange_for(code))
-        db.add(stock)
-        db.flush()
-    elif name and not stock.stock_name:
-        stock.stock_name = name
+    if stock:
+        if name and not stock.stock_name:
+            stock.stock_name = name
+        return stock
+    if not name and known_codes is not None and code not in known_codes:
+        return None
+    stock = Stock(stock_code=code, stock_name=name, exchange=exchange_for(code))
+    db.add(stock)
+    db.flush()
     return stock
 
 
@@ -206,17 +212,22 @@ def extract_topic(db: Session, topic: PlanetTopic, stock_catalog: list[Stock] | 
     text = f"{topic.title} {topic.content}"
     tokens = set(jieba.lcut(text))
     matches: dict[str, tuple[str, float, str]] = {}
+    catalog = stock_catalog if stock_catalog is not None else list(
+        db.scalars(select(Stock).where(Stock.stock_name != "")))
     for match in CODE_RE.finditer(text):
         code = match.group(1)
         matches[code] = (code, 1.0, match.group(0))
     for alias, (code, name) in STOCK_ALIASES.items():
         if alias in text:
             matches.setdefault(code, (name, 0.9, alias))
-    for stock in stock_catalog if stock_catalog is not None else list(db.scalars(select(Stock).where(Stock.stock_name != ""))):
+    for stock in catalog:
         if stock.stock_name in text:
             matches.setdefault(stock.stock_code, (stock.stock_name, 0.85, stock.stock_name))
+    known_codes = {stock.stock_code for stock in catalog if stock.stock_name}
     for code, (name, confidence, term) in matches.items():
-        stock = _stock_record(db, code, name if not name.isdigit() else "")
+        stock = _stock_record(db, code, name if not name.isdigit() else "", known_codes)
+        if stock is None:
+            continue
         if not db.scalar(select(TopicStock).where(TopicStock.topic_id == topic.id, TopicStock.stock_id == stock.id)):
             db.add(TopicStock(topic_id=topic.id, stock_id=stock.id,
                               mention_context=context(text, term), confidence=Decimal(str(confidence))))

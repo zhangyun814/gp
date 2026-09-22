@@ -22,7 +22,7 @@ if ! mkdir -p "$LOG_DIR"; then
 fi
 
 case "$(date '+%H')" in
-  06|07|08|09|10|11) ;;
+  06|07|08|09|10|11|12|13|14|15|16|17|18|19|20|21|22|23) ;;
   *)
     printf '[%s] skipped: outside 06:00-12:00 window\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" >> "$LOG_FILE"
     exit 0

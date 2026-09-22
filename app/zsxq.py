@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,7 +29,11 @@ def _text(value: Any) -> str:
 
 def clean_text(value: Any) -> str:
     text = html.unescape(_text(value))
-    text = HASHTAG_RE.sub(lambda match: f"#{match.group(1)}", text)
+    # Hashtag titles arrive URL-encoded (%23...%23); decode and strip the
+    # surrounding # markers so they render as plain #标签 text.
+    text = HASHTAG_RE.sub(
+        lambda match: "#" + urllib.parse.unquote(match.group(1)).strip("#").strip(),
+        text)
     return TAG_RE.sub("", text).strip()
 
 
